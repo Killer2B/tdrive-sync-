@@ -1,3 +1,23 @@
 .tdrive-sync-view .tdrive-sync-box { padding: 8px 0; line-height: 1.8; }
 .tdrive-sync-view .tdrive-sync-row { display: flex; gap: 8px; align-items: center; margin: 6px 0; flex-wrap: wrap; }
 .tdrive-sync-view .tdrive-sync-log { white-space: pre-wrap; font-size: 0.8em; max-height: 50vh; overflow: auto; user-select: text; }
+.tdrive-sync-view .tdrive-sync-preview-desc { opacity: 0.75; margin: 4px 0 10px; }
+
+/* Notification icon styling: the Lucide icon inherits the current text color, sized to the line. */
+.tdrive-notice .tdrive-notice-line { display: flex; align-items: center; flex-wrap: wrap; gap: 2px; line-height: 1.5; }
+.tdrive-notice .tdrive-notice-line + .tdrive-notice-line { margin-top: 2px; }
+.tdrive-notice .tdrive-notice-seg { display: inline-flex; align-items: center; }
+.tdrive-notice .tdrive-notice-seg + .tdrive-notice-seg { margin-left: 10px; }
+.tdrive-notice .tdrive-notice-icon { display: inline-flex; align-items: center; }
+.tdrive-notice .tdrive-notice-icon .svg-icon { width: 1em; height: 1em; }
+.tdrive-notice .tdrive-notice-text { margin-left: 4px; }
+.tdrive-status { display: inline-flex; align-items: center; }
+.tdrive-status .tdrive-status-icon { display: inline-flex; align-items: center; margin-right: 2px; }
+.tdrive-status .tdrive-status-icon .svg-icon { width: 1em; height: 1em; }
+.tdrive-sync-view .tdrive-sync-preview-notice {
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-s);
+  background: var(--background-secondary);
+  padding: 8px 10px;
+  font-size: 0.9em;
+}

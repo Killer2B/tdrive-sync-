@@ -1,6 +1,6 @@
 'use strict';
 const obsidian = require('obsidian');
-const { Plugin, PluginSettingTab, Setting, Notice, Modal, ItemView, requestUrl, TFile } = obsidian;
+const { Plugin, PluginSettingTab, Setting, Notice, Modal, ItemView, requestUrl, TFile, setIcon } = obsidian;
 const { TdriveClient } = require('./TdriveClient');
 const { ManifestStore } = require('./ManifestStore');
 const { SyncEngine } = require('./SyncEngine');
@@ -158,6 +158,32 @@ class ObsidianLocalFS {
 
 const fmtTime = (ms) => (ms ? new Date(ms).toLocaleString() : '—');
 
+/** Renders a real Lucide icon into `el` (Obsidian's own icon set), trying the fallback chain.
+ *  Returns true when an icon was drawn; false lets the caller fall back to a text glyph. */
+function applyIcon(el, names) {
+  if (!el || typeof setIcon !== 'function' || !names || !names.length) return false;
+  for (const name of names) {
+    try {
+      setIcon(el, name);
+      if (el.childElementCount > 0 && el.querySelector && el.querySelector('svg')) return true;
+      el.empty && el.empty();
+    } catch (e) { /* unknown icon name: try the next one */ }
+  }
+  return false;
+}
+
+/** Builds one line of a notice: a sequence of [icon, text] segments. */
+function buildNoticeLine(lineEl, segs) {
+  for (const s of segs || []) {
+    const box = lineEl.createSpan({ cls: 'tdrive-notice-seg' });
+    if (s.icon) {
+      const g = box.createSpan({ cls: 'tdrive-notice-icon' });
+      if (!applyIcon(g, NOTIFY.ICONS[s.icon])) g.setText(NOTIFY.GLYPH[s.icon] || '');
+    }
+    if (s.text) box.createSpan({ cls: 'tdrive-notice-text', text: (s.icon ? ' ' : '') + s.text });
+  }
+}
+
 class ConflictModal extends Modal {
   constructor(app, plugin, path) { super(app); this.plugin = plugin; this.path = path; }
   onOpen() {
@@ -242,11 +268,13 @@ class NotifyPreviewModal extends Modal {
       if (active) b.addClass('mod-cta');
       b.onclick = async () => { p.settings.notifyStyle = st; await p.saveSettings(); this.render(); p.notify(); };
     }
-    contentEl.createEl('p', { cls: 'mod-muted', text: t('notify.style.' + (p.settings.notifyStyle || 'technical') + 'Desc') });
+    contentEl.createEl('p', { cls: 'tdrive-sync-preview-desc', text: t('notify.style.' + (p.settings.notifyStyle || 'technical') + 'Desc') });
     for (const smp of NOTIFY.samples(p.settings.notifyStyle, t)) {
       const box = contentEl.createDiv({ cls: 'tdrive-sync-box' });
       box.createEl('h4', { text: smp.title });
-      box.createEl('pre', { cls: 'tdrive-sync-log' }).setText(smp.text || '');
+      const prev = box.createDiv({ cls: 'tdrive-notice tdrive-sync-preview-notice' });
+      const rows = (smp.rows && smp.rows.length) ? smp.rows : [[{ icon: null, text: smp.text }]];
+      for (const row of rows) buildNoticeLine(prev.createDiv({ cls: 'tdrive-notice-line' }), row);
     }
     const foot = contentEl.createDiv({ cls: 'tdrive-sync-row' });
     foot.createEl('button', { text: t('common.close') }).onclick = () => this.close();
@@ -477,19 +505,46 @@ class TdriveSyncPlugin extends Plugin {
   defaultRemoteFolder() { return '/Obsidian/' + this.app.vault.getName() + '/'; }
   redact(str) { return this.engine ? this.engine.client.redact(str) : String(str).replace(/tdk_[A-Za-z0-9_\-]+/g, 'tdk_***'); }
   async saveSettings() { await this.saveData(this.settings); }
+
+  /** Shows a styled notification. Non-technical styles render real Lucide icons (Obsidian's icon set) next to
+   *  each value; when the DOM/icons are unavailable (or for the technical style) the plain text is shown. */
+  showNotice(fmt) {
+    if (!fmt || !fmt.text) return;
+    const timeout = fmt.timeout || 0;
+    const notice = new Notice(fmt.text, timeout);
+    const rows = fmt.rows;
+    if (!rows || !rows.length || typeof setIcon !== 'function') return;
+    const el = notice.noticeEl || notice.containerEl;
+    if (!el || typeof el.empty !== 'function' || typeof el.createDiv !== 'function') return;
+    // DOM available: swap the plain message for the icon-rendered version.
+    el.empty(); el.addClass('tdrive-notice');
+    for (const row of rows) buildNoticeLine(el.createDiv({ cls: 'tdrive-notice-line' }), row);
+  }
+
   notify() { this.listeners.forEach((h) => { try { h(); } catch (e) { /* view gone */ } }); this.refreshStatus(); }
 
   refreshStatus() {
     if (!this.statusEl) return;
     const m = this.ledger.data.meta; const c = this.ledger.conflictKeys().length;
-    let txt = 'Tdrive: ';
+    let txt = 'Tdrive: '; let icon = null;
     if (this.settings.paused) txt += this.t('status.paused');
     else if (this.engine && this.engine.running && this.progress) {
-      txt += NOTIFY.formatProgress(this.settings.notifyStyle, this.t, this.progress);
+      const pr = NOTIFY.formatProgress(this.settings.notifyStyle, this.t, this.progress);
+      icon = pr.icon; txt += pr.text;
     } else if (m.lastRun && m.lastRun.status !== 'ok') txt += m.lastRun.status;
     else txt += m.lastSuccessAt ? this.t('status.synced') : '—';
     if (c) txt += ` ⚠${c}`;
-    this.statusEl.setText(txt);
+    // Real icon when the status-bar element allows it, otherwise plain text (never breaks the old behaviour).
+    const el = this.statusEl;
+    if (el && typeof el.empty === 'function' && typeof el.createSpan === 'function' && typeof setIcon === 'function') {
+      el.empty();
+      const box = el.createSpan({ cls: 'tdrive-status' });
+      if (icon) {
+        const g = box.createSpan({ cls: 'tdrive-status-icon' });
+        if (!applyIcon(g, NOTIFY.ICONS[icon])) g.setText(NOTIFY.GLYPH[icon] || '');
+      }
+      box.createSpan({ text: (icon ? ' ' : '') + txt });
+    } else el.setText(txt);
   }
 
   makeClient() {
@@ -497,7 +552,7 @@ class TdriveSyncPlugin extends Plugin {
     const known = this.ledger && this.ledger.data && this.ledger.data.meta && this.ledger.data.meta.uploadChunkSize;
     if (known) client._uploadChunk = known;   // reuse the server's enforced part size (avoids a re-opened session)
     // Retry notice (once per run, so notifications stay concise). Pure formatting; no engine change.
-    client.onRetry = (info) => { if (this._retryNotified) return; this._retryNotified = true; const n = NOTIFY.formatRetry(this.settings.notifyStyle, this.t, info); if (n && n.text) new Notice(n.text, n.timeout || 5000); };
+    client.onRetry = (info) => { if (this._retryNotified) return; this._retryNotified = true; this.showNotice(NOTIFY.formatRetry(this.settings.notifyStyle, this.t, info)); };
     return client;
   }
 
@@ -547,9 +602,9 @@ class TdriveSyncPlugin extends Plugin {
 
   async runSync(opts = {}) {
     const style = this.settings.notifyStyle;
-    if (this.settings.paused) { if (!opts.silent) { const n = NOTIFY.formatState(style, this.t, 'paused'); new Notice(n.text, n.timeout); } return null; }
-    if (!this.settings.apiKey) { if (!opts.silent) { const n = NOTIFY.formatState(style, this.t, 'noApiKey'); new Notice(n.text, n.timeout); } return null; }
-    if (this.engine && this.engine.running) { if (!opts.silent) { const n = NOTIFY.formatState(style, this.t, 'busy'); new Notice(n.text, n.timeout); } return null; }
+    if (this.settings.paused) { if (!opts.silent) this.showNotice(NOTIFY.formatState(style, this.t, 'paused')); return null; }
+    if (!this.settings.apiKey) { if (!opts.silent) this.showNotice(NOTIFY.formatState(style, this.t, 'noApiKey')); return null; }
+    if (this.engine && this.engine.running) { if (!opts.silent) this.showNotice(NOTIFY.formatState(style, this.t, 'busy')); return null; }
     this._retryNotified = false;
     const started = Date.now();
     let rep;
@@ -557,15 +612,13 @@ class TdriveSyncPlugin extends Plugin {
     catch (e) { new Notice('Tdrive: ' + this.redact(e.message), 8000); this.notify(); return null; }
     rep.durationMs = Date.now() - started;   // for the detailed style; the engine is untouched
     if (rep.status === 'locked') {
-      const n = NOTIFY.formatState(style, this.t, 'locked');
-      if (!opts.silent) new Notice(n.text, n.timeout);
+      if (!opts.silent) this.showNotice(NOTIFY.formatState(style, this.t, 'locked'));
       this.notify();
       return rep;
     }
     const blockedNotice = NOTIFY.formatWarning(style, this.t, rep);
-    if (blockedNotice && !opts.silent) new Notice(blockedNotice.text, blockedNotice.timeout);
-    const res = NOTIFY.formatResult(style, this.t, rep);
-    if (!opts.silent) new Notice(res.text, res.timeout);
+    if (blockedNotice && !opts.silent) this.showNotice(blockedNotice);
+    if (!opts.silent) this.showNotice(NOTIFY.formatResult(style, this.t, rep));
     this._quietUntil = Date.now() + 3000;   // ignore our own writes firing vault events right after
     // Remember the server's real part size so the next run does not re-open a probe session.
     const ch = this.engine && this.engine.client && this.engine.client._uploadChunk;
@@ -600,9 +653,9 @@ class TdriveSyncPlugin extends Plugin {
   /** Computes what a sync would do and shows it without changing anything. */
   async previewSync() {
     const style = this.settings.notifyStyle;
-    if (this.settings.paused) { const n = NOTIFY.formatState(style, this.t, 'paused'); new Notice(n.text, n.timeout); return; }
-    if (!this.settings.apiKey) { const n = NOTIFY.formatState(style, this.t, 'noApiKey'); new Notice(n.text, n.timeout); return; }
-    if (this.engine && this.engine.running) { const n = NOTIFY.formatState(style, this.t, 'busy'); new Notice(n.text, n.timeout); return; }
+    if (this.settings.paused) { this.showNotice(NOTIFY.formatState(style, this.t, 'paused')); return; }
+    if (!this.settings.apiKey) { this.showNotice(NOTIFY.formatState(style, this.t, 'noApiKey')); return; }
+    if (this.engine && this.engine.running) { this.showNotice(NOTIFY.formatState(style, this.t, 'busy')); return; }
     this._retryNotified = false;
     try {
       const rep = await this.makeEngine().syncNow({ dryRun: true });
