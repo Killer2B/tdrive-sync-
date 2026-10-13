@@ -1,5 +1,6 @@
 'use strict';
 const { concatBuffers, pool, clamp } = require('./util');
+const { sha256hex } = require('./Chunker');
 
 const MAX_CONCURRENCY = 6;
 
@@ -127,4 +128,40 @@ async function downloadFile(client, file, opts = {}) {
   return buf;
 }
 
-module.exports = { downloadFile, downloadSequential, downloadParallel, readRange, downloadToSink };
+/** The server's chunk manifest: { version, etag, chunkSize, chunker, totalChunks, chunks:[{idx,offset,size,checksum}] }.
+ *  Returns null when the object has no manifest. Pass `etag` to let the server answer 304 (unchanged). */
+async function fetchManifest(client, id, etag) {
+  try {
+    const res = await client.request({ path: `/files/${encodeURIComponent(id)}/chunks`, headers: etag ? { 'If-None-Match': etag } : undefined, allow304: true });
+    if (res && res.notModified) return { notModified: true };
+    return res || null;
+  } catch (e) {
+    if (e.status === 404) return null;
+    throw e;
+  }
+}
+
+/**
+ * Fetches only the byte ranges that changed, using the server's chunk manifest, and appends them as
+ * [{offset, size, checksum}] verified parts. The caller splices them into the local copy.
+ */
+async function downloadChangedRanges(client, id, changedChunks, onProgress) {
+  const parts = [];
+  let done = 0; let total = 0;
+  for (const c of changedChunks) total += c.size;
+  const conc = clamp(Number.isFinite(client._concurrencyHint) ? client._concurrencyHint : 3, 1, MAX_CONCURRENCY);
+  await pool(changedChunks, conc, async (c) => {
+    const buf = await readRange(client, id, c.offset, c.offset + c.size - 1);
+    if (buf.byteLength !== c.size) throw new Error(`Delta part ${c.idx} size mismatch: ${buf.byteLength} vs ${c.size}`);
+    if (c.checksum) {
+      const got = await sha256hex(new Uint8Array(buf));
+      if (got !== c.checksum) throw new Error(`Delta part ${c.idx} failed checksum verification`);
+    }
+    done += buf.byteLength;
+    if (onProgress) onProgress(done, total);
+    parts.push({ offset: c.offset, size: c.size, data: buf });
+  });
+  return parts;
+}
+
+module.exports = { downloadFile, downloadSequential, downloadParallel, readRange, downloadToSink, fetchManifest, downloadChangedRanges };

@@ -99,6 +99,7 @@ class TdriveClient {
         await this._wait(attempt, err.retryAfter);
         continue;
       }
+      if (res.status === 304) return { status: 304, notModified: true, headers: res.headers || {}, body: new ArrayBuffer(0) };
       if (res.status >= 400) throw this._httpError(res);
       if (binary) return { status: res.status, headers: res.headers || {}, body: res.body };
       let json;

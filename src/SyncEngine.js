@@ -3,7 +3,8 @@ const { sha256Hex, nfc, splitRel, splitPath, folderPathFor, makeExcluder, bytesT
 const { remoteSig, normalizeFileResponse } = require('./normalize');
 const { ConflictManager } = require('./ConflictManager');
 const { uploadFile, uploadRevision } = require('./UploadManager');
-const { downloadFile } = require('./DownloadManager');
+const { downloadFile, fetchManifest, downloadChangedRanges } = require('./DownloadManager');
+const { normalizeChunker } = require('./Chunker');
 
 const emptyReport = () => ({
   status: 'ok', uploaded: 0, downloaded: 0, skipped: 0, conflicts: 0, moved: 0,
@@ -32,19 +33,24 @@ function decide({ hasLocal, hasRemote, hasEntry, localChanged, remoteChanged, co
 
 const isNameConflict = (e) => e && (e.status === 409 || /exist|duplicate|conflict/i.test(e.code || ''));
 
+const DELTA_MIN_BYTES = 64 * 1024;   // below this a full download is simpler than a delta round-trip
+const MAX_MAP_CHUNKS = 4096;         // bound the chunk map kept in the ledger
+
 const safePlatform = () => {
   try { return (typeof navigator !== 'undefined' && (navigator.platform || navigator.userAgent || '')) || 'unknown'; }
   catch (e) { return 'unknown'; }
 };
 
 class SyncEngine {
-  constructor({ client, local, manifest, getSettings, onProgress, now, uploadFn, downloadFn, crypto, compressor, revisionFn }) {
+  constructor({ client, local, manifest, getSettings, onProgress, now, uploadFn, downloadFn, crypto, compressor, revisionFn, manifestFn, deltaFn }) {
     this.client = client; this.local = local; this.manifest = manifest; this.getSettings = getSettings;
     this.onProgress = onProgress || (() => {});
     this.now = now || (() => Date.now());
     this.uploadFn = uploadFn || uploadFile;
     this.revisionFn = revisionFn || uploadRevision;   // in-place update (only changed chunks)
     this.downloadFn = downloadFn || downloadFile;
+    this.manifestFn = manifestFn || fetchManifest;            // {version, etag, chunks[]}
+    this.deltaFn = deltaFn || downloadChangedRanges;          // download only the changed byte ranges
     this.crypto = crypto || null;   // optional { encrypt, decrypt } (E2EE); null = plaintext
     this.compressor = compressor || null;   // optional { maybeCompress, decompress }; null = store as-is
     this.conflicts = new ConflictManager({ manifest, local, now: this.now });
@@ -60,6 +66,68 @@ class SyncEngine {
   /** Emits byte-level progress for the file currently being transferred. */
   _fileProgress(key, action) {
     return (done, total) => this.onProgress({ phase: 'sync', current: key, action, bytes: { done: done || 0, total: total || 0 } });
+  }
+
+  // ---------- incremental transfer (chunk manifest + delta) ----------
+  /** The server's chunk manifest the way we store it: chunker + parallel size/hash arrays (offsets are the
+   *  running sums of the sizes). Returns { notModified } when the caller's ETag is still current. */
+  async _fetchChunkMap(remote, etag) {
+    if (!this.manifestFn) return null;
+    let m;
+    try { m = await this.manifestFn(this.client, remote.id, etag); } catch (e) { return null; }
+    if (!m) return null;
+    if (m.notModified) return { notModified: true };
+    const raw = (m.chunks || m.parts || []).slice().sort((a, b) => (a.idx ?? a.offset ?? 0) - (b.idx ?? b.offset ?? 0));
+    if (!raw.length) return null;
+    if (raw.length > MAX_MAP_CHUNKS) return { etag: m.etag, version: m.version, chunker: normalizeChunker(m.chunker), tooMany: true };
+    return {
+      etag: m.etag, version: m.version, chunker: normalizeChunker(m.chunker) || null, plan: raw,
+      sizes: raw.map((c) => c.size), hashes: raw.map((c) => c.checksum),
+    };
+  }
+
+  /** Stores a bounded chunk map on the ledger entry so a later change can be pulled incrementally. */
+  _storeMap(rel, map, remote) {
+    if (!map || map.tooMany || !Array.isArray(map.hashes) || !map.hashes.length) return;
+    const entry = this.manifest.getFile(rel) || {};
+    const sizes = map.sizes; const hashes = map.hashes;
+    if (!sizes || sizes.length !== hashes.length) return;
+    this.manifest.setFile(rel, { ...entry, remoteId: remote.id, remoteSize: remote.size, remoteMtime: remote.mtime, remoteSig: remote.sig || entry.remoteSig, syncedAt: this.now(), baseText: entry.baseText || null, chunkMap: { chunker: map.chunker, sizes, hashes }, etag: map.etag || null, version: map.version || null });
+  }
+
+  /** Ensures a chunk map exists for a remote file (used after a full download so the NEXT change is incremental). */
+  async _ensureMap(rel, remote) {
+    const entry = this.manifest.getFile(rel);
+    if (entry && entry.chunkMap && entry.remoteSize === remote.size) return entry.chunkMap;
+    if (!(remote.size >= DELTA_MIN_BYTES)) return null;
+    const map = await this._fetchChunkMap(remote, null);
+    if (map && !map.notModified) { this._storeMap(rel, map, remote); return map; }
+    return null;
+  }
+
+  /** Tries to fetch only what changed. Returns {unchanged} | {buffer, map} | null (=> do a full download). */
+  async _deltaPull(rel, remote, E, onProgress) {
+    if (!E || !E.chunkMap || !E.chunkMap.hashes || !this.manifestFn || !this.deltaFn) return null;
+    let map;
+    try { map = await this._fetchChunkMap(remote, E.etag); } catch (e) { return null; }
+    if (!map) return null;
+    if (map.notModified) return { unchanged: true };
+    if (map.tooMany || !map.hashes) return null;
+    const mine = new Set(E.chunkMap.hashes);
+    const changed = map.plan.filter((c) => !mine.has(c.checksum));
+    const full = remote.size || map.sizes.reduce((a, b) => a + b, 0);
+    if (!changed.length) return { unchanged: true, map };
+    const changedBytes = changed.reduce((n, c) => n + c.size, 0);
+    if (changedBytes > full * 0.6) return null;                 // little saving: a plain download is simpler
+    let local;
+    try { local = new Uint8Array(await this.local.readBinary(rel)); } catch (e) { return null; }
+    if (local.byteLength !== full) return null;                 // local is a different size: full download
+    const out = new Uint8Array(local);                          // copy to splice in place
+    try {
+      const parts = await this.deltaFn(this.client, remote.id, changed, onProgress);
+      for (const p of parts) out.set(new Uint8Array(p.data), p.offset);
+    } catch (e) { return null; }                                // verification failed: full download
+    return { buffer: out.buffer, map, savedBytes: changedBytes };
   }
 
   pause() { this.stopRequested = true; }
@@ -257,13 +325,13 @@ class SyncEngine {
   }
 
   // ---------- primitive operations ----------
-  async _replaceUpload({ name, folderPath, data, mtime, old, onProgress }) {
+  async _replaceUpload({ name, folderPath, data, mtime, old, onProgress, chunker, allowRevision }) {
     // In-place update first: when replacing a file we already have on the server, a revision sends ONLY the
-    // changed parts (unchanged parts are reused server-side), commits atomically, and keeps the same file id.
+    // changed chunks (unchanged chunks are reused server-side), commits atomically, and keeps the same file id.
     // Falls back to the normal create+trash path when a revision does not apply or the server declines it.
-    if (old && old.id && this.revisionFn) {
+    if (old && old.id && this.revisionFn && allowRevision !== false) {
       try {
-        const rev = await this.revisionFn(this.client, { id: old.id, name, folderPath, data, mtime, onProgress, ...this._upOpts() });
+        const rev = await this.revisionFn(this.client, { id: old.id, name, folderPath, data, mtime, onProgress, chunker, ...this._upOpts() });
         if (rev && rev.id) {
           this._remoteMutated = true;
           if (rev.name && rev.name !== name) return { ...(await this.client.rename(rev.id, name)), ...rev, name };
@@ -276,7 +344,7 @@ class SyncEngine {
         this.log('warn', `In-place update unavailable for ${name} (${this.client.redact(e.message)}); uploading a new version.`);
       }
     }
-    const attempt = () => this.uploadFn(this.client, { name, folderPath, data, mtime, onProgress, ...this._upOpts() });
+    const attempt = () => this.uploadFn(this.client, { name, folderPath, data, mtime, onProgress, chunker, ...this._upOpts() });
     let trashed = false; let res;
     try { res = await attempt(); }
     catch (e) {
@@ -307,9 +375,19 @@ class SyncEngine {
     // No known remote copy: a file with this name may still be there (listing gap, lost ledger).
     // Replace it rather than adding a second copy next to it.
     if (!oldRemote) oldRemote = (await this._dirIndex(folderPath)).files.get(nfc(name));
-    const res = await this._replaceUpload({ name, folderPath, data, mtime: lstat.mtime, old: oldRemote, onProgress });
+    // Reuse the chunker we already know for this file so a later edit keeps the same boundaries (best reuse).
+    const prev = this.manifest.getFile(rel);
+    const cdc = this.getSettings().cdcFiles !== false;    // false = plain fixed chunks (a revisable base)
+    const chunker = cdc ? ((prev && prev.chunkMap && prev.chunkMap.chunker) || undefined) : false;
+    // The deployed server cannot revise a CDC-chunked file in place (it commits a duplicate instead), so an
+    // in-place revision is only attempted for files that were NOT uploaded with content-defined chunking.
+    const baseIsCdc = !!(prev && prev.chunkMap && prev.chunkMap.chunker);
+    const res = await this._replaceUpload({ name, folderPath, data, mtime: lstat.mtime, old: oldRemote, onProgress, chunker, allowRevision: !baseIsCdc });
     (await this._dirIndex(folderPath)).files.set(nfc(name), res);
     this._record(rel, { lhash, lstat, remote: res, text: this._baseTextFor(data) });
+    // Record the resulting chunk map (the server's own, if it re-chunked) so the next change is incremental.
+    if (res.chunks && res.chunker) this._storeMap(rel, { chunker: res.chunker, sizes: res.chunks.map((c) => c.size), hashes: res.chunks.map((c) => c.hash), etag: null }, res);
+    else if (res.size >= DELTA_MIN_BYTES) await this._ensureMap(rel, res);
     this._touched && this._touched.set(rel, res.id);
     return res;
   }
@@ -636,14 +714,23 @@ class SyncEngine {
             localHash: null, localSize: st ? st.size : R.size, localMtime: st ? st.mtime : this.now(),
             remoteId: R.id, remoteSize: R.size, remoteMtime: R.mtime, remoteSig: R.sig || remoteSig(R), syncedAt: this.now(), baseText: null,
           });
+          await this._ensureMap(key, R);          // store the manifest so the NEXT change can be a delta pull
           this._touched.set(key, R.id);
           rep.downloaded++;
           break;
         }
-        const data = await this.downloadFn(this.client, R, { ...this._downOpts(), onProgress: onP });
+        // Incremental pull first: when we hold a chunk map for the old content, fetch only the changed byte
+        // ranges. Falls through to a normal (full) download whenever a delta is not applicable.
+        const delta = (L && E && R.size >= DELTA_MIN_BYTES) ? await this._deltaPull(key, R, E, onP) : null;
+        if (delta && delta.unchanged) { if (delta.map) this._storeMap(key, delta.map, R); rep.skipped++; break; }
+        const data = delta && delta.buffer ? delta.buffer : await this.downloadFn(this.client, R, { ...this._downOpts(), onProgress: onP });
         const r = await this._writeDownloaded(key, R, data, L, E);
         if (r.conflict) { await this.conflicts.record(key, R, data); rep.conflicts++; }
-        else if (r.unchanged) rep.skipped++; else rep.downloaded++;
+        else {
+          if (delta && delta.map) this._storeMap(key, delta.map, R);
+          else await this._ensureMap(key, R);                    // so the NEXT change can be incremental
+          if (r.unchanged) rep.skipped++; else rep.downloaded++;
+        }
         break;
       }
       case 'compare': {

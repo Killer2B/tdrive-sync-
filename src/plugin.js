@@ -43,6 +43,7 @@ const DEFAULTS = {
   e2eeSalt: '',
   compressTextFiles: true,             // gzip large text files before upload (saves data; server stores gzip)
   compressMinKB: 64,                   // only compress text files at least this large
+  cdcFiles: true,                      // content-defined chunking: cheap incremental downloads; false = revisable fixed chunks
   language: 'auto',                    // auto | ar | en
   notifyStyle: 'technical',            // technical | concise | elegant | detailed
 };
@@ -415,6 +416,8 @@ class TdriveSettingTab extends PluginSettingTab {
         const n = parseFloat(v); if (!Number.isFinite(n) || n < 0) return;
         s.compressMinKB = Math.round(Math.min(1024, Math.max(4, n))); await p.saveSettings();
       }));
+    new Setting(containerEl).setName(t('settings.cdc')).setDesc(t('settings.cdcDesc'))
+      .addToggle((el) => el.setValue(s.cdcFiles).onChange(async (v) => { s.cdcFiles = v; await p.saveSettings(); }));
 
     containerEl.createEl('h3', { text: t('sec.e2ee') });
     containerEl.createEl('p', { cls: 'mod-warning', text: t('e2ee.warning') });

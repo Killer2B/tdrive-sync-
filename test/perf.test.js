@@ -60,13 +60,16 @@ test('parallel resumable upload: parts run concurrently, bytes stay identical', 
   } finally { await env.stop(); }
 });
 
-test('configured upload chunk size changes the part count', async () => {
+test('resumable uploads use content-defined chunking within the server part cap', async () => {
   const env = await makeEnv();   // server: 1 MB one-shot limit, 1 MB chunk
   try {
     const data = big(4 * 1024 * 1024);
-    await uploadFile(env.client, { name: 'c.bin', folderPath: '/', data, mtime: 1, chunkBytes: 1024 * 1024 });
+    const f = await uploadFile(env.client, { name: 'c.bin', folderPath: '/', data, mtime: 1 });
     const parts = env.server.log.filter((l) => l.partIdx !== undefined);
-    assert.equal(parts.length, 4);
+    assert.ok(parts.length >= 2, 'split into multiple chunks: ' + parts.length);
+    assert.ok(f.chunker && f.chunker.algo === 'buzhash', 'a CDC chunker was used');
+    assert.ok(Array.isArray(f.chunks) && f.chunks.length === parts.length, 'chunk plan matches the parts sent');
+    assert.equal(sha(env.server.files.get(f.id).bytes), sha(data));
     assert.ok(env.server.maxSeen <= 5 * 1024 * 1024);
   } finally { await env.stop(); }
 });

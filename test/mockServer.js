@@ -54,10 +54,17 @@ function createMockServer(opts = {}) {
     const out = []; const n = Math.max(1, Math.ceil(file.bytes.length / size));
     for (let i = 0; i < n; i++) {
       const p = file.bytes.subarray(i * size, Math.min((i + 1) * size, file.bytes.length));
-      out.push({ idx: i, size: p.length, checksum: sha(p) });
+      out.push({ idx: i, offset: i * size, size: p.length, checksum: sha(p) });
     }
     return out;
   }
+  // A file's chunk plan: the client's (CDC) plan when it provided one, else a fixed-size plan.
+  function planOf(f) {
+    if (f.chunks && f.chunks.length) return f.chunks;
+    return chunkRows(f, effChunk());
+  }
+  const etagOf = (f) => 'manifest-' + sha(planOf(f).map((c) => c.checksum).join('\n'));
+  const versionOf = (f) => f.version || 1;
   st.addFile = (path, name, data) => { addFolder(path); const f = createFile(name, path, Buffer.from(data)).f; noteExternal('upload', f.id); return f; };
   st.modifyFile = (id, data) => { const f = st.files.get(id); f.bytes = Buffer.from(data); f.lastModified = tick(); noteExternal('update', id); return f; };
   st.removeFile = (id) => { st.files.get(id).trashed = true; noteExternal('trash', id); };
@@ -134,13 +141,31 @@ function createMockServer(opts = {}) {
         return ok(res, fileJson(r.f), 201);
       }
       let mm;
+      if ((mm = /^\/files\/([^/]+)\/chunks$/.exec(route)) && m === 'GET') {
+        const f = st.files.get(mm[1]); if (!f) return fail(res, 404, 'not_found', 'nope');
+        const etag = etagOf(f);
+        if (req.headers['if-none-match'] === etag) return send(res, 304, '');
+        const chunks = planOf(f);
+        return ok(res, { id: f.id, name: f.name, path: f.path, size: f.bytes.length, version: versionOf(f), etag, chunker: f.chunker || null, chunkSize: effChunk(), totalChunks: chunks.length, chunks });
+      }
+      if ((mm = /^\/files\/([^/]+)\/delta$/.exec(route)) && m === 'POST') {
+        const f = st.files.get(mm[1]); if (!f) return fail(res, 404, 'not_found', 'nope');
+        const j = JSON.parse(body.toString());
+        const mine = new Set(j.checksums || []);
+        const chunks = planOf(f);
+        const changed = chunks.filter((c) => !mine.has(c.checksum));
+        const changedRanges = []; for (const c of changed) { const last = changedRanges[changedRanges.length - 1]; if (last && last[0] + last[1] === c.offset) last[1] += c.size; else changedRanges.push([c.offset, c.size]); }
+        return ok(res, { version: versionOf(f), etag: etagOf(f), size: f.bytes.length, chunkSize: effChunk(), chunker: f.chunker || null, totalChunks: chunks.length, unchanged: chunks.filter((c) => mine.has(c.checksum)).map((c) => c.checksum), changed, changedRanges, checksums: chunks.map((c) => c.checksum) });
+      }
       if ((mm = /^\/files\/([^/]+)\/content$/.exec(route)) && m === 'GET') {
         const f = st.files.get(mm[1]); if (!f) return fail(res, 404, 'not_found', 'nope');
+        const etag = etagOf(f);
+        if (req.headers['if-none-match'] === etag) return send(res, 304, '', { ETag: etag });
         const rg = /bytes=(\d+)-(\d*)/.exec(req.headers.range || '');
-        if (!rg) return send(res, 200, f.bytes);
+        if (!rg) return send(res, 200, f.bytes, { ETag: etag });
         const a = Number(rg[1]); const b = Math.min(rg[2] ? Number(rg[2]) : f.bytes.length - 1, f.bytes.length - 1);
         if (a >= f.bytes.length) return fail(res, 416, 'range', 'bad range');
-        return send(res, 206, f.bytes.subarray(a, b + 1), { 'Content-Range': `bytes ${a}-${b}/${f.bytes.length}` });
+        return send(res, 206, f.bytes.subarray(a, b + 1), { 'Content-Range': `bytes ${a}-${b}/${f.bytes.length}`, ETag: etag });
       }
       if ((mm = /^\/files\/([^/]+)$/.exec(route))) {
         const f = st.files.get(mm[1]); if (!f) return fail(res, 404, 'not_found', 'nope');
@@ -175,16 +200,18 @@ function createMockServer(opts = {}) {
         let s = [...st.uploads.values()].find((x) => x.clientKey === j.clientKey);
         if (!s) {
           s = { id: 'u' + st.nextId++, ...j, parts: new Map(), done: null, reuse: new Set() };
+          if (j.chunker && j.chunker.algo !== 'buzhash') return fail(res, 400, 'INVALID_CHUNKER', 'bad chunker');
           // A revision session targets an existing file and exposes its stored parts (by checksum) for reuse.
           if (j.baseId) {
             const base = st.files.get(j.baseId);
             if (!base || base.trashed) return fail(res, 404, 'not_found', 'no base file');
             if (st.noRevisions) return fail(res, 400, 'invalid_request', 'revisions not supported');
-            s.base = { id: j.baseId, parts: chunkRows(base, effChunk()) };
+            s.base = { id: j.baseId, parts: planOf(base) };
           }
           st.uploads.set(s.id, s);
         }
-        const out = { id: s.id, chunkSize: effChunk(), totalChunks: Math.max(1, Math.ceil(s.size / effChunk())), received: [...s.parts.keys()], uncertain: [], inProgress: [] };
+        const out = { id: s.id, chunkSize: effChunk(), totalChunks: s.totalChunks || Math.max(1, Math.ceil(s.size / effChunk())), received: [...s.parts.keys()], uncertain: [], inProgress: [] };
+        if (s.chunker) out.chunker = s.chunker;
         if (s.base) { out.revision = true; out.base = s.base; }
         return ok(res, out, 201);
       }
@@ -194,8 +221,8 @@ function createMockServer(opts = {}) {
         if (req.headers['x-chunk-reuse'] === '1') {
           // Claim an already-stored chunk with no body — only honoured when the base really stores that hash.
           const want = req.headers['x-content-sha256'];
-          const row = s.base && s.base.parts[idx];
-          if (!row || row.checksum !== want || !st.chunkStore.has(want)) return fail(res, 409, 'ChunkNotAvailable', 'not stored server-side');
+          const inBase = s.base && s.base.parts.some((p) => p.checksum === want);
+          if (!inBase || !st.chunkStore.has(want)) return fail(res, 409, 'ChunkNotAvailable', 'not stored server-side');
           s.reuse.add(idx); s.parts.set(idx, st.chunkStore.get(want));
           return ok(res, { idx, reused: true });
         }
@@ -206,10 +233,11 @@ function createMockServer(opts = {}) {
       if ((mm = /^\/uploads\/([^/]+)\/complete$/.exec(route)) && m === 'POST') {
         const s = st.uploads.get(mm[1]); if (!s) return fail(res, 404, 'not_found', 'no session');
         if (s.done) return ok(res, fileJson(st.files.get(s.done)));
-        const stored = st.maxBody ? s.parts.size : null;
-        const n = stored != null ? Math.max(...s.parts.keys()) + 1 : Math.ceil(s.size / effChunk());
+        const n = s.totalChunks || (st.maxBody ? Math.max(...s.parts.keys()) + 1 : Math.ceil(s.size / effChunk()));
         for (let i = 0; i < n; i++) if (!s.parts.has(i)) return fail(res, 409, 'incomplete', 'missing part ' + i);
         const all = Buffer.concat([...Array(n).keys()].map((i) => s.parts.get(i)));
+        // The stored chunk plan mirrors what the client sent (offsets/sizes), so a manifest/delta matches it.
+        const plan = []; { let off = 0; for (let i = 0; i < n; i++) { const b = s.parts.get(i); plan.push({ idx: i, offset: off, size: b.length, checksum: sha(b) }); off += b.length; } }
         if (s.base) {
           // Atomic replace: the file keeps its id (and name/path); the previous bytes are archived as a version.
           const base = st.files.get(s.base.id);
@@ -217,13 +245,14 @@ function createMockServer(opts = {}) {
             base.versions = base.versions || [];
             base.versions.push({ version: base.versions.length + 1, bytes: base.bytes });
             base.bytes = all; base.lastModified = tick();
-            st.chunkStore.set(sha(all.slice(0, effChunk())), all.slice(0, effChunk()));
+            base.chunks = plan; base.chunker = s.chunker || null; base.version = (base.version || 1) + 1;
             s.done = base.id; note('revision', base.id);
             return ok(res, { id: base.id, revision: true, committed: true, version: base.versions.length + 1, ...fileJson(base) });
           }
         }
         const r = createFile(s.name, s.path, all, s.lastModified);
         if (r.err) return fail(res, ...r.err);
+        r.f.chunks = plan; r.f.chunker = s.chunker || null;
         s.done = r.f.id; note('upload', r.f.id); return ok(res, fileJson(r.f));
       }
       if ((mm = /^\/uploads\/([^/]+)$/.exec(route)) && m === 'GET') {
