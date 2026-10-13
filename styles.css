@@ -1,0 +1,3 @@
+.tdrive-sync-view .tdrive-sync-box { padding: 8px 0; line-height: 1.8; }
+.tdrive-sync-view .tdrive-sync-row { display: flex; gap: 8px; align-items: center; margin: 6px 0; flex-wrap: wrap; }
+.tdrive-sync-view .tdrive-sync-log { white-space: pre-wrap; font-size: 0.8em; max-height: 50vh; overflow: auto; user-select: text; }
