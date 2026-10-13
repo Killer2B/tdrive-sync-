@@ -104,10 +104,10 @@ module.exports = { cdc, fixed, hashPlan, cdcPlan, fingerprintOf, chooseChunker, 
 __defs["Compressor"] = function (module, exports, require) {
 // Bandwidth reduction for note-like files.
 //
-// IMPORTANT CONTEXT: the Tdrive API has NO partial/delta content update (PATCH /files/:id only accepts
-// name/path/favorite) and NO server-side part de-duplication, so a changed file must be re-uploaded in full.
-// The one real saving left is to send FEWER BYTES for the same content: gzip. Obsidian vaults are mostly
-// text (Markdown/JSON/CSV/…), which typically compresses 5–20×, so a one-character edit to a 200 KB note
+// CONTEXT: the API DOES support sending/receiving only the changes (chunk manifest + delta + CDC + revisions) —
+// see src/Chunker.js and the delta/revision paths. Compression is an ADDITIONAL saving that stacks with that:
+// it sends FEWER BYTES for the content that has to move. Obsidian vaults are mostly text
+// (Markdown/JSON/CSV/…), which typically compresses 5–20×, so a one-character edit to a 200 KB note
 // transfers ~15–30 KB instead of 200 KB.
 //
 // This is applied ONLY when it is clearly worth it and clearly safe:
