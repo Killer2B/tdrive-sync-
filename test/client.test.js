@@ -61,6 +61,21 @@ test('4b 5xx is retried with exponential backoff and, if it persists, gives up w
   } finally { await env.stop(); }
 });
 
+test('4c a bare { error, code, retryAfter } 503 (ControlUnavailable) is parsed and retryable', async () => {
+  const http = require('http');
+  const { TdriveClient } = require('../src/TdriveClient');
+  const body = JSON.stringify({ error: 'ControlUnavailable', code: 'ControlUnavailable', retryAfter: 1 });
+  const srv = http.createServer((req, res) => { res.writeHead(503, { 'Content-Type': 'application/json', 'Retry-After': '1', 'Content-Length': Buffer.byteLength(body) }); res.end(body); });
+  await new Promise((r) => srv.listen(0, r));
+  try {
+    const c = new TdriveClient({
+      baseUrl: 'http://127.0.0.1:' + srv.address().port, apiKey: 'tdk_x', allowInsecure: true, maxRetries: 0, maxServerRetries: 0,
+      transport: async ({ url, method, headers, body: b }) => { const r = await fetch(url, { method, headers, body: b }); return { status: r.status, headers: Object.fromEntries([...r.headers].map(([k, v]) => [k.toLowerCase(), v])), body: await r.arrayBuffer() }; },
+    });
+    await assert.rejects(c.me(), (e) => e.code === 'ControlUnavailable' && e.retryable === true && e.retryAfter === 1 && e.status === 503);
+  } finally { await new Promise((r) => srv.close(r)); }
+});
+
 test('2 network drop during resumable upload recovers via retry; bytes identical', async () => {
   const env = await makeEnv();
   try {
