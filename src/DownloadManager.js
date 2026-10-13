@@ -116,13 +116,14 @@ async function downloadFile(client, file, opts = {}) {
   const hint = Number.isFinite(client._concurrencyHint) ? client._concurrencyHint : Infinity;
   const concurrency = clamp(Math.min(opts.concurrency || 1, hint), 1, MAX_CONCURRENCY);
   const known = Number.isFinite(file.size) ? file.size : null;
-  // Streaming to disk is only safe for a plaintext download of a known size.
-  if (opts.sink && known !== null && known > 0 && !opts.crypto) return downloadToSink(client, file, chunkBytes, opts.onProgress, opts.sink);
+  // Streaming to disk is only safe for a plaintext, un-compressed download of a known size.
+  if (opts.sink && known !== null && known > 0 && !opts.crypto && !opts.compressor) return downloadToSink(client, file, chunkBytes, opts.onProgress, opts.sink);
   let buf;
   if (known === 0) buf = new ArrayBuffer(0);
   else if (known !== null && known > chunkBytes && concurrency > 1) buf = await downloadParallel(client, file, chunkBytes, concurrency, opts.onProgress);
   else buf = await downloadSequential(client, file, chunkBytes, opts.onProgress);
-  if (opts.crypto) buf = await opts.crypto.decrypt(buf);
+  if (opts.crypto) buf = await opts.crypto.decrypt(buf);       // decrypt first, then inflate
+  if (opts.compressor) buf = await opts.compressor.decompress(buf);
   return buf;
 }
 

@@ -5,6 +5,7 @@ const { TdriveClient } = require('./TdriveClient');
 const { ManifestStore } = require('./ManifestStore');
 const { SyncEngine } = require('./SyncEngine');
 const { CryptoManager } = require('./CryptoManager');
+const { Compressor } = require('./Compressor');
 const { makeT, resolveLang } = require('./i18n');
 const NOTIFY = require('./notify');
 
@@ -40,6 +41,8 @@ const DEFAULTS = {
   e2eeEnabled: false,                  // encrypt file contents before upload
   e2eePassphrase: '',
   e2eeSalt: '',
+  compressTextFiles: true,             // gzip large text files before upload (saves data; server stores gzip)
+  compressMinKB: 64,                   // only compress text files at least this large
   language: 'auto',                    // auto | ar | en
   notifyStyle: 'technical',            // technical | concise | elegant | detailed
 };
@@ -403,6 +406,16 @@ class TdriveSettingTab extends PluginSettingTab {
         s.syncOnChangeDelaySeconds = Math.min(300, Math.max(2, n)); await p.saveSettings();
       }));
 
+    containerEl.createEl('h3', { text: t('sec.bandwidth') });
+    containerEl.createEl('p', { cls: 'tdrive-sync-hint', text: t('compress.note') });
+    new Setting(containerEl).setName(t('settings.compress')).setDesc(t('settings.compressDesc'))
+      .addToggle((el) => el.setValue(s.compressTextFiles).onChange(async (v) => { s.compressTextFiles = v; await p.saveSettings(); }));
+    new Setting(containerEl).setName(t('settings.compressMin')).setDesc(t('settings.compressMinDesc'))
+      .addText((el) => el.setValue(String(s.compressMinKB)).onChange(async (v) => {
+        const n = parseFloat(v); if (!Number.isFinite(n) || n < 0) return;
+        s.compressMinKB = Math.round(Math.min(1024, Math.max(4, n))); await p.saveSettings();
+      }));
+
     containerEl.createEl('h3', { text: t('sec.e2ee') });
     containerEl.createEl('p', { cls: 'mod-warning', text: t('e2ee.warning') });
     new Setting(containerEl).setName(t('settings.e2eeEnable')).setDesc(t('settings.e2eeEnableDesc'))
@@ -567,6 +580,13 @@ class TdriveSyncPlugin extends Plugin {
     return this._crypto;
   }
 
+  /** Returns a cached Compressor when compression is enabled, else null (store bytes as-is). */
+  makeCompressor() {
+    const s = this.settings;
+    if (!s.compressTextFiles) return null;
+    return new Compressor({ minBytes: Math.max(4, Number(s.compressMinKB) || 64) * 1024 });
+  }
+
   makeEngine() {
     const client = this.makeClient();
     const getSettings = () => ({
@@ -579,7 +599,7 @@ class TdriveSyncPlugin extends Plugin {
     });
     let lastTick = 0;
     this.engine = new SyncEngine({
-      client, local: this.local, manifest: this.ledger, getSettings, crypto: this.makeCrypto(),
+      client, local: this.local, manifest: this.ledger, getSettings, crypto: this.makeCrypto(), compressor: this.makeCompressor(),
       onProgress: (p) => { this.progress = p; const now = Date.now(); if (now - lastTick > 400) { lastTick = now; this.notify(); } },
     });
     return this.engine;

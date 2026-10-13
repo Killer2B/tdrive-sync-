@@ -38,22 +38,23 @@ const safePlatform = () => {
 };
 
 class SyncEngine {
-  constructor({ client, local, manifest, getSettings, onProgress, now, uploadFn, downloadFn, crypto }) {
+  constructor({ client, local, manifest, getSettings, onProgress, now, uploadFn, downloadFn, crypto, compressor }) {
     this.client = client; this.local = local; this.manifest = manifest; this.getSettings = getSettings;
     this.onProgress = onProgress || (() => {});
     this.now = now || (() => Date.now());
     this.uploadFn = uploadFn || uploadFile;
     this.downloadFn = downloadFn || downloadFile;
     this.crypto = crypto || null;   // optional { encrypt, decrypt } (E2EE); null = plaintext
+    this.compressor = compressor || null;   // optional { maybeCompress, decompress }; null = store as-is
     this.conflicts = new ConflictManager({ manifest, local, now: this.now });
     this.running = false; this.stopRequested = false;
     this._folders = new Set();
     this._dirCache = new Map();
   }
 
-  /** Transfer options (chunk size, parallel parts, encryption) taken from the live settings. */
-  _upOpts() { const s = this.getSettings(); return { chunkBytes: s.uploadChunkBytes, concurrency: s.maxConcurrentParts, crypto: this.crypto }; }
-  _downOpts() { const s = this.getSettings(); return { chunkBytes: s.downloadChunkBytes, concurrency: s.maxConcurrentParts, crypto: this.crypto }; }
+  /** Transfer options (chunk size, parallel parts, encryption, compression) taken from the live settings. */
+  _upOpts() { const s = this.getSettings(); return { chunkBytes: s.uploadChunkBytes, concurrency: s.maxConcurrentParts, crypto: this.crypto, compressor: this.compressor }; }
+  _downOpts() { const s = this.getSettings(); return { chunkBytes: s.downloadChunkBytes, concurrency: s.maxConcurrentParts, crypto: this.crypto, compressor: this.compressor }; }
 
   /** Emits byte-level progress for the file currently being transferred. */
   _fileProgress(key, action) {
@@ -604,7 +605,7 @@ class SyncEngine {
         const s0 = this.getSettings();
         const threshold = Number.isFinite(s0.streamThresholdBytes) && s0.streamThresholdBytes > 0 ? s0.streamThresholdBytes : 8 * 1024 * 1024;
         const canStream = s0.streamLargeDownloads !== false && this.local && typeof this.local.beginStreamWrite === 'function' && this.local.canStream !== false
-          && !this.crypto && !L && Number.isFinite(R.size) && R.size >= threshold;
+          && !this.crypto && !this.compressor && !L && Number.isFinite(R.size) && R.size >= threshold;
         if (canStream) {
           const sink = await this.local.beginStreamWrite(key);
           try {

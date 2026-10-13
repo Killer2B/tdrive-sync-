@@ -97,7 +97,9 @@ async function uploadResumable(client, { name, folderPath, data, mtime, onProgre
 
 async function uploadFile(client, opts) {
   let data = asArrayBuffer(opts.data);
-  // Encrypt (when enabled) before sizing: the server and every downstream check work on ciphertext.
+  // Shrink first (text-like files only), then encrypt: compressing ciphertext would do nothing. Both steps
+  // are transparent on download, and both are self-describing so older plaintext files keep working.
+  if (opts.compressor) data = await opts.compressor.maybeCompress(opts.name, data);
   if (opts.crypto) data = await opts.crypto.encrypt(data);
   const lim = await client.limits();
   if (data.byteLength <= lim.oneShotMaxBytes) return uploadOneShot(client, { ...opts, data });
