@@ -1,5 +1,5 @@
 'use strict';
-const { sha256Hex, nfc, splitRel, splitPath, folderPathFor, makeExcluder } = require('./util');
+const { sha256Hex, nfc, splitRel, splitPath, folderPathFor, makeExcluder, bytesToHuman } = require('./util');
 const { remoteSig } = require('./normalize');
 const { ConflictManager } = require('./ConflictManager');
 const { uploadFile } = require('./UploadManager');
@@ -33,16 +33,26 @@ function decide({ hasLocal, hasRemote, hasEntry, localChanged, remoteChanged, co
 const isNameConflict = (e) => e && (e.status === 409 || /exist|duplicate|conflict/i.test(e.code || ''));
 
 class SyncEngine {
-  constructor({ client, local, manifest, getSettings, onProgress, now, uploadFn, downloadFn }) {
+  constructor({ client, local, manifest, getSettings, onProgress, now, uploadFn, downloadFn, crypto }) {
     this.client = client; this.local = local; this.manifest = manifest; this.getSettings = getSettings;
     this.onProgress = onProgress || (() => {});
     this.now = now || (() => Date.now());
     this.uploadFn = uploadFn || uploadFile;
     this.downloadFn = downloadFn || downloadFile;
+    this.crypto = crypto || null;   // optional { encrypt, decrypt } (E2EE); null = plaintext
     this.conflicts = new ConflictManager({ manifest, local, now: this.now });
     this.running = false; this.stopRequested = false;
     this._folders = new Set();
     this._dirCache = new Map();
+  }
+
+  /** Transfer options (chunk size, parallel parts, encryption) taken from the live settings. */
+  _upOpts() { const s = this.getSettings(); return { chunkBytes: s.uploadChunkBytes, concurrency: s.maxConcurrentParts, crypto: this.crypto }; }
+  _downOpts() { const s = this.getSettings(); return { chunkBytes: s.downloadChunkBytes, concurrency: s.maxConcurrentParts, crypto: this.crypto }; }
+
+  /** Emits byte-level progress for the file currently being transferred. */
+  _fileProgress(key, action) {
+    return (done, total) => this.onProgress({ phase: 'sync', current: key, action, bytes: { done: done || 0, total: total || 0 } });
   }
 
   pause() { this.stopRequested = true; }
@@ -146,8 +156,8 @@ class SyncEngine {
   }
 
   // ---------- primitive operations ----------
-  async _replaceUpload({ name, folderPath, data, mtime, old }) {
-    const attempt = () => this.uploadFn(this.client, { name, folderPath, data, mtime });
+  async _replaceUpload({ name, folderPath, data, mtime, old, onProgress }) {
+    const attempt = () => this.uploadFn(this.client, { name, folderPath, data, mtime, onProgress, ...this._upOpts() });
     let trashed = false; let res;
     try { res = await attempt(); }
     catch (e) {
@@ -167,7 +177,7 @@ class SyncEngine {
     return res;
   }
 
-  async pushLocal(rel, oldRemote) {
+  async pushLocal(rel, oldRemote, onProgress) {
     const lstat = await this.local.stat(rel); // stat BEFORE read: a concurrent edit is then detected next run
     const data = await this.local.readBinary(rel);
     const lhash = await sha256Hex(data);
@@ -177,15 +187,15 @@ class SyncEngine {
     // No known remote copy: a file with this name may still be there (listing gap, lost ledger).
     // Replace it rather than adding a second copy next to it.
     if (!oldRemote) oldRemote = (await this._dirIndex(folderPath)).files.get(nfc(name));
-    const res = await this._replaceUpload({ name, folderPath, data, mtime: lstat.mtime, old: oldRemote });
+    const res = await this._replaceUpload({ name, folderPath, data, mtime: lstat.mtime, old: oldRemote, onProgress });
     (await this._dirIndex(folderPath)).files.set(nfc(name), res);
     this._record(rel, { lhash, lstat, remote: res });
     this._touched && this._touched.set(rel, res.id);
     return res;
   }
 
-  async pullRemote(rel, remote) {
-    const data = await this.downloadFn(this.client, remote, { chunkBytes: this.getSettings().downloadChunkBytes });
+  async pullRemote(rel, remote, onProgress) {
+    const data = await this.downloadFn(this.client, remote, { ...this._downOpts(), onProgress });
     return this._writeDownloaded(rel, remote, data, null, null);
   }
 
@@ -275,11 +285,35 @@ class SyncEngine {
         else if (p.action === 'skip') rep.skipped++;
       }
       let done = 0; let sinceSave = 0;
+      // ---- size + network guards (skip heavy transfers without ever touching data) ----
+      const cellular = typeof s.networkIsCellular === 'function' ? !!s.networkIsCellular() : false;
+      const netBlockAll = cellular && !!s.wifiOnly;
+      const netMaxBytes = cellular && !s.wifiOnly && Number.isFinite(s.cellularMaxFileBytes) && s.cellularMaxFileBytes > 0 ? s.cellularMaxFileBytes : 0;
+      const maxFileBytes = Number.isFinite(s.maxFileBytes) && s.maxFileBytes > 0 ? s.maxFileBytes : 0;
+      const sizeWarned = new Set(); const netWarned = { all: false, cellular: false };
+      if (netBlockAll) rep.warnings.push('Wi-Fi only is on and this connection looks cellular: only local changes were handled this run.');
       for (const p of todo) {
         if (this.stopRequested) { rep.status = 'paused'; break; }
         this.onProgress({ phase: 'sync', done: done++, total: todo.length, current: p.key, action: p.action });
         const allowed = this._allowed(p.action, mode, blockDeletes);
         if (!allowed) { rep.skipped++; if (p.action === 'skip-conflict') rep.conflicts++; continue; }
+        const netAction = p.action === 'upload' || p.action === 'download' || p.action === 'compare' || p.action === 'deleteRemote';
+        if (netBlockAll && netAction) {
+          rep.skipped++;
+          if (!netWarned.all) { netWarned.all = true; this.log('warn', 'Skipped network transfers (Wi-Fi only on a cellular connection).'); }
+          continue;
+        }
+        const bytes = p.action === 'upload' ? (p.L && p.L.size) : (p.R && p.R.size);
+        if (maxFileBytes && bytes && bytes > maxFileBytes) {
+          rep.skipped++;
+          if (!sizeWarned.has('max')) { sizeWarned.add('max'); const msg = `Skipped file(s) larger than the ${bytesToHuman(maxFileBytes)} size limit (first: ${p.key}).`; rep.warnings.push(msg); this.log('warn', msg); }
+          continue;
+        }
+        if (netMaxBytes && netAction && bytes && bytes > netMaxBytes) {
+          rep.skipped++;
+          if (!netWarned.cellular) { netWarned.cellular = true; const msg = `On cellular: deferred file(s) larger than ${bytesToHuman(netMaxBytes)}.`; rep.warnings.push(msg); this.log('warn', msg); }
+          continue;
+        }
         try {
           await this._execute(p, rep);
           netFails = 0;
@@ -332,10 +366,11 @@ class SyncEngine {
 
   async _execute(p, rep) {
     const { key, L, R, E } = p;
+    const onP = this._fileProgress(key, p.action);
     switch (p.action) {
-      case 'upload': await this.pushLocal(key, R); rep.uploaded++; break;
+      case 'upload': await this.pushLocal(key, R, onP); rep.uploaded++; break;
       case 'download': {
-        const data = await this.downloadFn(this.client, R, { chunkBytes: this.getSettings().downloadChunkBytes });
+        const data = await this.downloadFn(this.client, R, { ...this._downOpts(), onProgress: onP });
         const r = await this._writeDownloaded(key, R, data, L, E);
         if (r.conflict) { await this.conflicts.record(key, R, data); rep.conflicts++; }
         else if (r.unchanged) rep.skipped++; else rep.downloaded++;
@@ -344,7 +379,7 @@ class SyncEngine {
       case 'compare': {
         const ldata = await this.local.readBinary(key); const lhash = await sha256Hex(ldata);
         const lstat = await this.local.stat(key);
-        const rdata = await this.downloadFn(this.client, R, { chunkBytes: this.getSettings().downloadChunkBytes });
+        const rdata = await this.downloadFn(this.client, R, { ...this._downOpts(), onProgress: onP });
         if ((await sha256Hex(rdata)) === lhash) { this._record(key, { lhash, lstat, remote: R }); rep.skipped++; }
         else { await this.conflicts.record(key, R, rdata); rep.conflicts++; }
         break;

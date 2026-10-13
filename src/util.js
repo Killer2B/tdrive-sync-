@@ -101,7 +101,51 @@ function concatBuffers(chunks) {
   return out.buffer;
 }
 
+function hexToBytes(hex) {
+  const s = String(hex == null ? '' : hex);
+  const n = s.length >> 1; const out = new Uint8Array(n);
+  for (let i = 0; i < n; i++) out[i] = parseInt(s.substr(i * 2, 2), 16) || 0;
+  return out;
+}
+
+/** SHA-256 of a region of an ArrayBuffer WITHOUT copying it (crypto.subtle accepts a typed-array view). */
+async function sha256HexView(buffer, offset, length) {
+  const view = new Uint8Array(buffer, offset, length);
+  return toHex(await crypto.subtle.digest('SHA-256', view));
+}
+
+const clamp = (n, lo, hi) => Math.min(hi, Math.max(lo, n));
+
+/** Runs `worker(item, index)` over `items` with at most `limit` in flight. Result order matches input.
+ *  Stops pulling new work after the first rejection and rethrows it (already-started work settles). */
+async function pool(items, limit, worker) {
+  const results = new Array(items.length);
+  const size = Math.max(1, Math.min(Math.floor(limit) || 1, items.length || 1));
+  let next = 0; let aborted = false;
+  const runner = async () => {
+    while (!aborted) {
+      const i = next++;
+      if (i >= items.length) return;
+      try { results[i] = await worker(items[i], i); }
+      catch (e) { aborted = true; throw e; }
+    }
+  };
+  const settled = await Promise.allSettled(Array.from({ length: size }, runner));
+  const failed = settled.find((r) => r.status === 'rejected');
+  if (failed) throw failed.reason;
+  return results;
+}
+
+const UNITS = ['B', 'KB', 'MB', 'GB', 'TB'];
+function bytesToHuman(n) {
+  if (!Number.isFinite(n) || n < 0) return '—';
+  let v = n; let u = 0;
+  while (v >= 1024 && u < UNITS.length - 1) { v /= 1024; u++; }
+  return (u === 0 ? String(v) : v.toFixed(v < 10 ? 1 : 0)) + ' ' + UNITS[u];
+}
+
 module.exports = {
-  asArrayBuffer, toHex, sha256Hex, uuidFromHex, randomUuid, sleep, nfc, splitPath, splitRel,
-  folderPathFor, globToRegExp, makeExcluder, redact, stamp, suffixName, concatBuffers,
+  asArrayBuffer, toHex, sha256Hex, hexToBytes, sha256HexView, uuidFromHex, randomUuid, sleep, nfc,
+  splitPath, splitRel, folderPathFor, globToRegExp, makeExcluder, redact, stamp, suffixName, concatBuffers,
+  clamp, pool, bytesToHuman,
 };

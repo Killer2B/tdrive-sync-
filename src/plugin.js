@@ -4,6 +4,7 @@ const { Plugin, PluginSettingTab, Setting, Notice, Modal, ItemView, requestUrl, 
 const { TdriveClient } = require('./TdriveClient');
 const { ManifestStore } = require('./ManifestStore');
 const { SyncEngine } = require('./SyncEngine');
+const { CryptoManager } = require('./CryptoManager');
 
 const VIEW_TYPE = 'tdrive-sync-status';
 
@@ -19,7 +20,30 @@ const DEFAULTS = {
   paused: false,
   excludePatterns: ['**/*.tmp', '**/Thumbs.db'],
   downloadChunkBytes: 4 * 1024 * 1024,
+  uploadChunkBytes: 4 * 1024 * 1024,   // 0 = auto (server value, capped at 5 MB)
+  maxConcurrentParts: 3,               // parallel upload/download parts (1 = sequential)
+  maxFileSizeMB: 0,                    // skip files larger than this (0 = unlimited)
+  wifiOnly: false,                     // do not use the network on a cellular connection
+  cellularMaxFileMB: 5,                // on cellular, defer files larger than this (0 = never defer)
+  syncOnChange: false,                 // auto-sync shortly after a local edit
+  syncOnChangeDelaySeconds: 5,         // debounce window for change-triggered syncs
+  e2eeEnabled: false,                  // encrypt file contents before upload
+  e2eePassphrase: '',
+  e2eeSalt: '',
 };
+
+/** Best-effort cellular detection. Unknown -> false (allow), so a false positive can never block sync. */
+function networkLooksCellular() {
+  try {
+    const c = (typeof navigator !== 'undefined') && (navigator.connection || navigator.mozConnection || navigator.webkitConnection);
+    if (!c) return false;
+    const t = c.type ? String(c.type).toLowerCase() : '';
+    if (t) return /cellular|2g|3g|4g|5g|mobile/.test(t);
+    const et = c.effectiveType ? String(c.effectiveType).toLowerCase() : '';
+    if (et) return /2g|3g|slow/.test(et);
+  } catch (e) { /* unknown connection: treat as fine */ }
+  return false;
+}
 
 /** requestUrl bypasses CORS and works on Android + Windows. Body/response are ArrayBuffers. */
 async function obsidianTransport({ url, method, headers, body }) {
@@ -216,8 +240,60 @@ class TdriveSettingTab extends PluginSettingTab {
     new Setting(containerEl).setName('مزامنة عند فتح التطبيق').addToggle((t) => t.setValue(s.syncOnStartup).onChange(async (v) => { s.syncOnStartup = v; await p.saveSettings(); }));
     new Setting(containerEl).setName('استثناءات (نمط في كل سطر)').setDesc('المجلدات والملفات المخفية (.obsidian و .git ...) مستثناة دائمًا. مثال: Private/**')
       .addTextArea((t) => t.setValue(s.excludePatterns.join('\n')).onChange(async (v) => { s.excludePatterns = v.split('\n').map((x) => x.trim()).filter(Boolean); await p.saveSettings(); }));
+    containerEl.createEl('h3', { text: 'الأداء' });
+    new Setting(containerEl).setName('حجم جزء الرفع (MB)').setDesc('0 = تلقائي. ملاحظة: بعض الخوادم (Tdrive) تفرض حجم الجزء الخاص بها في جلسة الرفع، فيُستخدم حجم الخادم تلقائيًا عندها.')
+      .addText((t) => t.setValue(String(s.uploadChunkBytes ? s.uploadChunkBytes / 1048576 : 0)).onChange(async (v) => {
+        const n = parseFloat(v); if (!Number.isFinite(n) || n < 0) return;
+        s.uploadChunkBytes = n === 0 ? 0 : Math.round(Math.min(5, Math.max(0.25, n)) * 1048576); await p.saveSettings();
+      }));
+    new Setting(containerEl).setName('حجم جزء التنزيل (MB)').setDesc('افتراضي 4. الأجزاء تُنزَّل بالتوازي عند دعم الخادم.')
+      .addText((t) => t.setValue(String(Math.round(s.downloadChunkBytes / 1048576))).onChange(async (v) => {
+        const n = parseFloat(v); if (!Number.isFinite(n) || n <= 0) return;
+        s.downloadChunkBytes = Math.round(Math.min(5, Math.max(1, n)) * 1048576); await p.saveSettings();
+      }));
+    new Setting(containerEl).setName('عدد الأجزاء المتوازية').setDesc('1 = تسلسلي. 3-4 يسرّع الملفات الكبيرة كثيرًا.')
+      .addText((t) => t.setValue(String(s.maxConcurrentParts)).onChange(async (v) => {
+        const n = parseInt(v, 10); if (!Number.isFinite(n)) return;
+        s.maxConcurrentParts = Math.min(6, Math.max(1, n)); await p.saveSettings();
+      }));
+    new Setting(containerEl).setName('أقصى حجم ملف (MB)').setDesc('0 = بلا حد. تُتجاهل الملفات الأكبر (فيديو مثلًا) فلا تُرفع ولا تُنزَّل.')
+      .addText((t) => t.setValue(String(s.maxFileSizeMB)).onChange(async (v) => {
+        const n = parseFloat(v); if (!Number.isFinite(n) || n < 0) return;
+        s.maxFileSizeMB = Math.round(n); await p.saveSettings();
+      }));
+
+    containerEl.createEl('h3', { text: 'الشبكة' });
+    new Setting(containerEl).setName('Wi-Fi فقط').setDesc('عند اكتشاف اتصال خلوي، تُعالج التغييرات المحلية فقط دون نقل بيانات عبر الشبكة.')
+      .addToggle((t) => t.setValue(s.wifiOnly).onChange(async (v) => { s.wifiOnly = v; await p.saveSettings(); }));
+    new Setting(containerEl).setName('تأجيل الملفات الكبيرة على الشبكة الخلوية (MB)').setDesc('عند اتصال خلوي (وبدون "Wi-Fi فقط") تُؤجَّل الملفات الأكبر من هذا الحجم. 0 = لا تأجيل.')
+      .addText((t) => t.setValue(String(s.cellularMaxFileMB)).onChange(async (v) => {
+        const n = parseFloat(v); if (!Number.isFinite(n) || n < 0) return;
+        s.cellularMaxFileMB = Math.round(n); await p.saveSettings();
+      }));
+
+    containerEl.createEl('h3', { text: 'المزامنة عند التغيير' });
+    new Setting(containerEl).setName('مزامنة تلقائية عند التعديل').setDesc('تشغّل مزامنة بعد فترة قصيرة من آخر تعديل محلي.')
+      .addToggle((t) => t.setValue(s.syncOnChange).onChange(async (v) => { s.syncOnChange = v; await p.saveSettings(); }));
+    new Setting(containerEl).setName('مهلة التأخير (ثوانٍ)').setDesc('تُجمَّع التعديلات المتتابعة ثم تُزامَن مرة واحدة.')
+      .addText((t) => t.setValue(String(s.syncOnChangeDelaySeconds)).onChange(async (v) => {
+        const n = parseInt(v, 10); if (!Number.isFinite(n)) return;
+        s.syncOnChangeDelaySeconds = Math.min(300, Math.max(2, n)); await p.saveSettings();
+      }));
+
+    containerEl.createEl('h3', { text: 'التشفير من طرف العميل (E2EE)' });
+    containerEl.createEl('p', { cls: 'mod-warning', text: 'عند التفعيل تُشفَّر محتويات الملفات قبل رفعها (AES-256-GCM). الخادم لا يرى إلا نصًّا مشفَّرًا. أسماء الملفات والمجلدات تبقى ظاهرة. استخدم عبارة مرور طويلة وفريدة (16 حرفًا+)؛ لا يمكن استرجاع الملفات إن فقدتها، ويجب أن تكون العبارة نفسها على كل الأجهزة.' });
+    new Setting(containerEl).setName('تفعيل التشفير').setDesc('يُطبَّق على الملفات التي تُرفع بعد التفعيل. الملفات القديمة غير المشفّرة تُنزَّل كما هي.')
+      .addToggle((t) => t.setValue(s.e2eeEnabled).onChange(async (v) => { s.e2eeEnabled = v; await p.saveSettings(); }));
+    new Setting(containerEl).setName('عبارة المرور').setDesc('تُحفظ نصًّا عاديًا في data.json — لا تشارك مجلد .obsidian.')
+      .addText((t) => { t.inputEl.type = 'password'; t.setValue(s.e2eePassphrase).onChange(async (v) => { s.e2eePassphrase = v; await p.saveSettings(); }); });
+    new Setting(containerEl).setName('بذرة التشفير (متقدّم)').setDesc('اتركها فارغة للقيمة الافتراضية. غيّرها فقط إن أردت مفتاحًا خاصًّا، ويجب أن تتطابق على كل الأجهزة.')
+      .addText((t) => t.setValue(s.e2eeSalt).onChange(async (v) => { s.e2eeSalt = v.trim(); await p.saveSettings(); }));
+
+    containerEl.createEl('h3', { text: 'الاتصال والسجل' });
     new Setting(containerEl).setName('اختبار الاتصال').addButton((b) => b.setButtonText('اختبار').onClick(() => p.testConnection()));
     new Setting(containerEl).setName('الحالة والسجل').addButton((b) => b.setButtonText('فتح').onClick(() => p.activateView()));
+    new Setting(containerEl).setName('تصدير السجل إلى ملف').setDesc('يكتب سجل المزامنة في ملف نصي داخل مجلد الإضافة لإرفاقه عند الإبلاغ عن مشكلة.')
+      .addButton((b) => b.setButtonText('تصدير').onClick(() => p.exportLog()));
     new Setting(containerEl).setName('إيقاف / استئناف المزامنة').addButton((b) => b.setButtonText(s.paused ? 'استئناف' : 'إيقاف').onClick(async () => { await (s.paused ? p.resume() : p.pause()); this.display(); }));
     new Setting(containerEl).setName('فحص شكل استجابات API').setDesc('يعرض أسماء الحقول التي ترجعها Tdrive (بدون محتوى ملفاتك) ضمن السجل — مفيد للإبلاغ عن مشاكل التوافق.')
       .addButton((b) => b.setButtonText('فحص').onClick(() => p.probeApi()));
@@ -226,7 +302,8 @@ class TdriveSettingTab extends PluginSettingTab {
 
 class TdriveSyncPlugin extends Plugin {
   async onload() {
-    this.listeners = new Set(); this.progress = null; this.engine = null; this.connection = 'لم يُختبر بعد'; this._timer = null;
+    this.listeners = new Set(); this.progress = null; this.engine = null; this.connection = 'لم يُختبر بعد';
+    this._timer = null; this._changeTimer = null; this._quietUntil = 0; this._crypto = null; this._cryptoTag = '';
     this.settings = Object.assign({}, DEFAULTS, await this.loadData());
     const ad = this.app.vault.adapter; const statePath = this.manifest.dir + '/sync-state.json';
     this.ledger = new ManifestStore({
@@ -249,13 +326,41 @@ class TdriveSyncPlugin extends Plugin {
     cmd('approve-deletes', 'Approve Pending Deletions', () => this.approveDeletes());
     cmd('view-conflicts', 'View Conflicts', () => this.activateView());
     cmd('view-sync-log', 'View Sync Log', () => this.activateView());
+    cmd('export-log', 'Export Sync Log…', () => this.exportLog());
     cmd('pause-sync', 'Pause Sync', () => this.pause());
     cmd('resume-sync', 'Resume Sync', () => this.resume());
+    this.registerChangeSync();
     this.setupAutoSync(); this.refreshStatus();
     if (this.settings.syncOnStartup) this.app.workspace.onLayoutReady(() => window.setTimeout(() => this.runSync({ silent: true }), 5000));
   }
 
-  onunload() { if (this._timer) window.clearInterval(this._timer); if (this.engine) this.engine.pause(); }
+  onunload() {
+    if (this._timer) window.clearInterval(this._timer);
+    if (this._changeTimer) window.clearTimeout(this._changeTimer);
+    if (this.engine) this.engine.pause();
+  }
+
+  /** Debounced auto-sync on local edits (opt-in). Sync's own writes are ignored via the running flag and a
+   *  short quiet window after each run, so a sync never re-triggers itself in a loop. */
+  registerChangeSync() {
+    const vault = this.app && this.app.vault;
+    if (!vault || typeof vault.on !== 'function') return;   // adapter without events (tests/older builds)
+    const schedule = (file) => {
+      if (!this.settings.syncOnChange || this.settings.paused) return;
+      if (!this.settings.apiKey) return;
+      if (this.engine && this.engine.running) return;
+      if (Date.now() < this._quietUntil) return;
+      const p = file && file.path ? String(file.path) : '';
+      if (p.startsWith('.')) return;                        // .obsidian, hidden files, sync-state
+      if (this._changeTimer) window.clearTimeout(this._changeTimer);
+      const delay = Math.max(2, Number(this.settings.syncOnChangeDelaySeconds) || 5) * 1000;
+      this._changeTimer = window.setTimeout(() => { this._changeTimer = null; this.runSync({ silent: true, reason: 'change' }); }, delay);
+    };
+    this.registerEvent(this.app.vault.on('modify', schedule));
+    this.registerEvent(this.app.vault.on('create', schedule));
+    this.registerEvent(this.app.vault.on('delete', schedule));
+    this.registerEvent(this.app.vault.on('rename', (f) => schedule(f)));
+  }
 
   defaultRemoteFolder() { return '/Obsidian/' + this.app.vault.getName() + '/'; }
   redact(t) { return this.engine ? this.engine.client.redact(t) : String(t).replace(/tdk_[A-Za-z0-9_\-]+/g, 'tdk_***'); }
@@ -267,23 +372,49 @@ class TdriveSyncPlugin extends Plugin {
     const m = this.ledger.data.meta; const c = this.ledger.conflictKeys().length;
     let t = 'Tdrive: ';
     if (this.settings.paused) t += 'متوقفة';
-    else if (this.engine && this.engine.running && this.progress) t += `${this.progress.done}/${this.progress.total}`;
-    else if (m.lastRun && m.lastRun.status !== 'ok') t += m.lastRun.status;
+    else if (this.engine && this.engine.running && this.progress) {
+      const pr = this.progress;
+      if (pr.bytes && pr.bytes.total) {
+        const pct = Math.min(100, Math.floor((pr.bytes.done / pr.bytes.total) * 100));
+        const label = { upload: '↑', download: '↓', compare: '⇅' }[pr.action] || '';
+        t += `${label}${pct}%`;
+      } else t += `${pr.done || 0}/${pr.total || 0}`;
+    } else if (m.lastRun && m.lastRun.status !== 'ok') t += m.lastRun.status;
     else t += m.lastSuccessAt ? 'متزامنة' : '—';
     if (c) t += ` ⚠${c}`;
     this.statusEl.setText(t);
   }
 
   makeClient() {
-    return new TdriveClient({ baseUrl: this.settings.baseUrl, apiKey: this.settings.apiKey, transport: obsidianTransport });
+    const client = new TdriveClient({ baseUrl: this.settings.baseUrl, apiKey: this.settings.apiKey, transport: obsidianTransport });
+    const known = this.ledger && this.ledger.data && this.ledger.data.meta && this.ledger.data.meta.uploadChunkSize;
+    if (known) client._uploadChunk = known;   // reuse the server's enforced part size (avoids a re-opened session)
+    return client;
+  }
+
+  /** Returns a cached CryptoManager when E2EE is on and a passphrase is set, else null (plaintext).
+   *  The salt is a constant (or a user-set value) so all devices with the same passphrase agree on the key. */
+  makeCrypto() {
+    const s = this.settings;
+    if (!s.e2eeEnabled || !s.e2eePassphrase) { this._crypto = null; this._cryptoTag = ''; return null; }
+    const salt = s.e2eeSalt || CryptoManager.DEFAULT_SALT || 'tdrive-sync-e2ee-v1';
+    const tag = s.e2eePassphrase + '|' + salt;
+    if (!this._crypto || this._cryptoTag !== tag) { this._crypto = new CryptoManager(s.e2eePassphrase, salt); this._cryptoTag = tag; }
+    return this._crypto;
   }
 
   makeEngine() {
     const client = this.makeClient();
-    const getSettings = () => ({ ...this.settings, remoteFolder: this.settings.remoteFolder || this.defaultRemoteFolder() });
+    const getSettings = () => ({
+      ...this.settings,
+      remoteFolder: this.settings.remoteFolder || this.defaultRemoteFolder(),
+      maxFileBytes: this.settings.maxFileSizeMB > 0 ? this.settings.maxFileSizeMB * 1024 * 1024 : 0,
+      cellularMaxFileBytes: this.settings.cellularMaxFileMB > 0 ? this.settings.cellularMaxFileMB * 1024 * 1024 : 0,
+      networkIsCellular: networkLooksCellular,
+    });
     let lastTick = 0;
     this.engine = new SyncEngine({
-      client, local: this.local, manifest: this.ledger, getSettings,
+      client, local: this.local, manifest: this.ledger, getSettings, crypto: this.makeCrypto(),
       onProgress: (p) => { this.progress = p; const now = Date.now(); if (now - lastTick > 400) { lastTick = now; this.notify(); } },
     });
     return this.engine;
@@ -293,7 +424,9 @@ class TdriveSyncPlugin extends Plugin {
     try {
       const client = this.makeClient();
       await client.me(); const lim = await client.limits();
-      this.connection = `متصل ✓ (${new Date().toLocaleTimeString()}) — حجم الجزء ${Math.round(lim.chunkBytes / 1024)} KB`;
+      let part = null;
+      try { part = await client.uploadChunkSize(); } catch (e) { /* optional */ }
+      this.connection = `متصل ✓ (${new Date().toLocaleTimeString()}) — حجم الجزء ${Math.round((part || lim.chunkBytes) / 1024)} KB`;
       new Notice('Tdrive: الاتصال ناجح');
     } catch (e) {
       this.connection = 'فشل: ' + this.redact(e.message);
@@ -313,8 +446,35 @@ class TdriveSyncPlugin extends Plugin {
     if (rep.blockedDeletes && rep.blockedDeletes.items.length && !opts.silent) new Notice(`Tdrive: حُجب حذف ${rep.blockedDeletes.items.length} ملف (${rep.blockedDeletes.reason}). راجعها من أمر "Approve Pending Deletions".`, 10000);
     if (rep.status === 'ok') { if (!opts.silent) new Notice('Tdrive: اكتملت المزامنة ' + msg); }
     else new Notice(`Tdrive: لم تكتمل المزامنة (${rep.status}) ${msg}` + (rep.failures[0] ? '\n' + rep.failures[0].error : ''), 10000);
+    this._quietUntil = Date.now() + 3000;   // ignore our own writes firing vault events right after
+    // Remember the server's real part size so the next run does not re-open a probe session.
+    const ch = this.engine && this.engine.client && this.engine.client._uploadChunk;
+    if (ch && ch !== this.ledger.data.meta.uploadChunkSize) { this.ledger.data.meta.uploadChunkSize = ch; try { await this.ledger.save(); } catch (e) { /* non-fatal */ } }
     this.notify();
     return rep;
+  }
+
+  /** Writes the sync log + a small diagnostic header to a text file inside the plugin folder (never synced:
+   *  it lives under .obsidian). Handy to attach when reporting a problem. */
+  async exportLog() {
+    try {
+      const meta = this.ledger.data.meta;
+      const head = [
+        'Tdrive Sync — log export',
+        'generated: ' + new Date().toISOString(),
+        'plugin: ' + (this.manifest && this.manifest.id) + ' ' + (this.manifest && this.manifest.version),
+        'server: ' + this.settings.baseUrl,
+        'mode: ' + this.settings.mode + ' | deletion: ' + this.settings.deletionPolicy + ' | e2ee: ' + (this.settings.e2eeEnabled ? 'on' : 'off'),
+        'lastRun: ' + JSON.stringify(meta.lastRun),
+        'lastSuccessAt: ' + (meta.lastSuccessAt ? new Date(meta.lastSuccessAt).toISOString() : '—'),
+        'open conflicts: ' + this.ledger.conflictKeys().length + ' | files tracked: ' + this.ledger.count(),
+        '---',
+      ].join('\n');
+      const body = this.ledger.data.log.map((l) => `${new Date(l.t).toISOString()} [${l.level}] ${l.msg}`).join('\n');
+      const path = this.manifest.dir + '/tdrive-sync-log.txt';
+      await this.app.vault.adapter.write(path, this.redact(head + '\n' + body + '\n'));
+      new Notice('تم تصدير السجل إلى: ' + path, 8000);
+    } catch (e) { new Notice('تعذر تصدير السجل: ' + this.redact(e.message), 8000); }
   }
 
   approveDeletes() {
@@ -359,7 +519,11 @@ class TdriveSyncPlugin extends Plugin {
 
   async activateView() {
     let leaf = this.app.workspace.getLeavesOfType(VIEW_TYPE)[0];
-    if (!leaf) { leaf = this.app.workspace.getRightLeaf(false); await leaf.setViewState({ type: VIEW_TYPE, active: true }); }
+    if (!leaf) {
+      leaf = this.app.workspace.getRightLeaf(false);
+      if (!leaf) { new Notice('Tdrive: تعذّر فتح لوحة الحالة'); return; }
+      await leaf.setViewState({ type: VIEW_TYPE, active: true });
+    }
     this.app.workspace.revealLeaf(leaf);
   }
 

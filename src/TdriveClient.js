@@ -1,5 +1,5 @@
 'use strict';
-const { sleep, redact } = require('./util');
+const { sleep, redact, randomUuid } = require('./util');
 const { normalizeFileResponse, normalizeList } = require('./normalize');
 
 class TdriveError extends Error {
@@ -123,6 +123,25 @@ class TdriveClient {
     const one = Math.min(Number.isFinite(srvOne) ? srvOne : chunk, MAX_PART_BYTES);
     this._info = { chunkBytes: chunk, oneShotMaxBytes: one };
     return this._info;
+  }
+
+  /** The REAL resumable part size. `GET /api/v1` may advertise a different `chunkBytes`, and the server only
+   *  reveals its true `chunkSize` in an upload session — so open a throwaway session (valid-format fingerprint)
+   *  and abort it. Cached per client. Returns null when the server does not report one. */
+  async uploadChunkSize() {
+    if (this._uploadChunkSize) return this._uploadChunkSize;
+    const lim = await this.limits();
+    const size = Math.max(1, lim.oneShotMaxBytes + 1);
+    const body = new TextEncoder().encode(JSON.stringify({
+      name: 'probe', path: '/', size, fingerprint: '0'.repeat(64), clientKey: randomUuid(),
+      contentType: 'application/octet-stream', lastModified: Date.now(),
+    })).buffer;
+    const sess = await this.request({ method: 'POST', path: '/uploads', headers: { 'Content-Type': 'application/json' }, body });
+    const id = sess && (sess.id || sess.uploadId);
+    const cs = Number(sess && sess.chunkSize);
+    try { if (id) await this.request({ method: 'DELETE', path: '/uploads/' + encodeURIComponent(id) }); } catch (e) { /* abort is best effort */ }
+    if (Number.isFinite(cs) && cs > 0) this._uploadChunkSize = cs;
+    return this._uploadChunkSize || null;
   }
 
   /** Lists one folder (all pages). Returns {files, folders} (normalized, de-duplicated by id). */

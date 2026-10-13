@@ -1,20 +1,50 @@
 'use strict';
-const { concatBuffers } = require('./util');
+const { concatBuffers, pool, clamp } = require('./util');
+
+const MAX_CONCURRENCY = 6;
+
+/** One HTTP Range request for a byte slice of a file. */
+function rangeRequest(client, id, from, to) {
+  return client.request({
+    path: '/files/' + encodeURIComponent(id) + '/content',
+    headers: { Range: `bytes=${from}-${to}` }, binary: true,
+  });
+}
 
 /**
- * Ranged download (HTTP Range is documented). Each chunk is its own request, so an interrupted
- * transfer resumes from the last received offset instead of restarting. Verified by size.
+ * Reads the exact byte range [from, to] and returns it. Some servers answer a Range request with a SHORTER
+ * body than asked (they may even echo the full Content-Range while truncating), so the range is re-requested
+ * from where the body actually ended until it is complete. This is what makes parallel downloads safe.
  */
-async function downloadFile(client, file, opts = {}) {
-  const chunkBytes = opts.chunkBytes || 4 * 1024 * 1024;
+async function readRange(client, id, from, to) {
+  const chunks = []; let cur = from;
+  while (cur <= to) {
+    const res = await rangeRequest(client, id, cur, to);
+    if (res.status === 200) {
+      // Server ignored Range and returned the whole body.
+      const whole = cur === 0 ? res.body : res.body.slice(cur);
+      if (whole.byteLength === 0) throw new Error('Empty download response');
+      chunks.push(whole); cur += whole.byteLength;
+      continue;
+    }
+    if (res.status !== 206) throw new Error('Unexpected download status ' + res.status);
+    const m = /bytes\s+(\d+)-(\d+)\/(\d+|\*)/i.exec(res.headers['content-range'] || '');
+    if (m && Number(m[1]) !== cur) throw new Error('Unexpected Content-Range start');
+    if (res.body.byteLength === 0) throw new Error('Empty download part');
+    chunks.push(res.body); cur += res.body.byteLength;
+  }
+  return concatBuffers(chunks);
+}
+
+/**
+ * Sequential ranged download. Each chunk is its own request that resumes from the last received offset, so an
+ * interrupted (or truncated) transfer recovers instead of restarting. Works even when the server ignores Range.
+ */
+async function downloadSequential(client, file, chunkBytes, onProgress) {
   const known = Number.isFinite(file.size) ? file.size : null;
-  if (known === 0) return new ArrayBuffer(0);
   const chunks = []; let offset = 0; let total = known;
   while (total === null || offset < total) {
-    const res = await client.request({
-      path: '/files/' + encodeURIComponent(file.id) + '/content',
-      headers: { Range: `bytes=${offset}-${offset + chunkBytes - 1}` }, binary: true,
-    });
+    const res = await rangeRequest(client, file.id, offset, offset + chunkBytes - 1);
     if (res.status === 206) {
       const m = /bytes\s+(\d+)-(\d+)\/(\d+|\*)/i.exec(res.headers['content-range'] || '');
       if (m) {
@@ -23,16 +53,51 @@ async function downloadFile(client, file, opts = {}) {
       }
       if (res.body.byteLength === 0) break;
       chunks.push(res.body); offset += res.body.byteLength;
-      if (total === null && res.body.byteLength < chunkBytes) { total = offset; }
+      if (total === null && res.body.byteLength < chunkBytes) total = offset;
     } else {
       // Server ignored Range and returned the whole body.
       const whole = offset === 0 ? res.body : res.body.slice(offset);
       chunks.push(whole); offset += whole.byteLength; total = offset;
     }
-    if (opts.onProgress) opts.onProgress(offset, total);
+    if (onProgress) onProgress(offset, total);
   }
   if (known !== null && offset !== known) throw new Error(`Incomplete download: ${offset}/${known} bytes`);
   return concatBuffers(chunks);
 }
 
-module.exports = { downloadFile };
+/**
+ * Parallel ranged download. The first chunk is read alone; the rest are fanned out. Every part is read with
+ * `readRange`, so a truncated/errored response is completed instead of silently corrupting the file.
+ */
+async function downloadParallel(client, file, chunkBytes, concurrency, onProgress) {
+  const known = file.size;
+  const first = await readRange(client, file.id, 0, Math.min(chunkBytes, known) - 1);
+  let done = first.byteLength;
+  if (onProgress) onProgress(Math.min(done, known), known);
+  const ranges = [];
+  for (let off = first.byteLength; off < known; off += chunkBytes) ranges.push([off, Math.min(off + chunkBytes, known) - 1]);
+  const parts = await pool(ranges, clamp(concurrency, 1, MAX_CONCURRENCY), async ([a, b]) => {
+    const buf = await readRange(client, file.id, a, b);
+    done += buf.byteLength;
+    if (onProgress) onProgress(Math.min(done, known), known);
+    return buf;
+  });
+  const out = concatBuffers([first, ...parts]);
+  if (out.byteLength !== known) throw new Error(`Incomplete download: ${out.byteLength}/${known} bytes`);
+  if (onProgress) onProgress(known, known);
+  return out;
+}
+
+async function downloadFile(client, file, opts = {}) {
+  const chunkBytes = opts.chunkBytes || 4 * 1024 * 1024;
+  const concurrency = clamp(opts.concurrency || 1, 1, MAX_CONCURRENCY);
+  const known = Number.isFinite(file.size) ? file.size : null;
+  let buf;
+  if (known === 0) buf = new ArrayBuffer(0);
+  else if (known !== null && known > chunkBytes && concurrency > 1) buf = await downloadParallel(client, file, chunkBytes, concurrency, opts.onProgress);
+  else buf = await downloadSequential(client, file, chunkBytes, opts.onProgress);
+  if (opts.crypto) buf = await opts.crypto.decrypt(buf);
+  return buf;
+}
+
+module.exports = { downloadFile, downloadSequential, downloadParallel, readRange };
