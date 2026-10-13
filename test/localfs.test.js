@@ -15,7 +15,7 @@ function loadPlugin() {
   const stub = {
     Plugin: class { constructor(app, manifest) { this.app = app; this.manifest = manifest; this.data = {}; }
       async loadData() { return this.data; } async saveData(d) { this.data = d; }
-      addCommand() {} addSettingTab() {} registerView() {} addRibbonIcon() {} addStatusBarItem() { return { setText() {} }; } registerInterval() {} },
+      addCommand() {} addSettingTab() {} registerView() {} addRibbonIcon() {} addStatusBarItem() { return { setText() {} }; } registerInterval() {} registerEvent() {} },
     PluginSettingTab: class {}, Setting: class {}, Notice: class {}, Modal: class {}, ItemView: class {}, TFile, requestUrl: async () => ({}),
   };
   const orig = Module._load;
@@ -72,7 +72,7 @@ test('a real folder-creation failure names the folder (shown in the sync report)
   fa.app.vault.createFolder = async () => { throw new Error('boom'); };
   fa.app.vault.adapter.mkdir = async () => { throw new Error('boom2'); };
   const local = await localFor(fa);
-  await assert.rejects(() => local.writeBinary('Notes/a.md', buf('x')), /تعذر إنشاء المجلد المحلي "Notes".*ملف بنفس الاسم/);
+  await assert.rejects(() => local.writeBinary('Notes/a.md', buf('x')), /(تعذر إنشاء المجلد المحلي "Notes"|Could not create the local folder "Notes").*(ملف بنفس الاسم|same name)/);
 });
 
 test('file written to disk but missing from the vault index is NOT treated as deleted locally', async () => {

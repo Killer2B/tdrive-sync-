@@ -62,10 +62,16 @@ function globToRegExp(glob) {
   return new RegExp('^' + re + '$');
 }
 
-// Hidden segments (".obsidian", ".git", ".trash"...) are always excluded.
+// Names created by the conflict manager: "<base> (<label> <stamp>)<ext>". They must NEVER be synced back,
+// otherwise every device would upload conflict copies and the mess would grow.
+const CONFLICT_COPY_RE = /\((?:Tdrive conflict|Tdrive local backup)(?: \d+)? \d{4}-\d{2}-\d{2} \d{2}-\d{2}-\d{2}\)/;
+function isConflictCopy(rel) { return CONFLICT_COPY_RE.test(String(rel || '')); }
+
+// Hidden segments (".obsidian", ".git", ".trash"...) are always excluded, as are conflict copies.
 function makeExcluder(patterns) {
   const res = (patterns || []).map((p) => p.trim()).filter(Boolean).map(globToRegExp);
   return (rel) => {
+    if (isConflictCopy(rel)) return true;
     if (splitPath(rel).some((seg) => seg.startsWith('.'))) return true;
     return res.some((r) => r.test(rel));
   };
@@ -146,6 +152,6 @@ function bytesToHuman(n) {
 
 module.exports = {
   asArrayBuffer, toHex, sha256Hex, hexToBytes, sha256HexView, uuidFromHex, randomUuid, sleep, nfc,
-  splitPath, splitRel, folderPathFor, globToRegExp, makeExcluder, redact, stamp, suffixName, concatBuffers,
+  splitPath, splitRel, folderPathFor, globToRegExp, makeExcluder, isConflictCopy, redact, stamp, suffixName, concatBuffers,
   clamp, pool, bytesToHuman,
 };

@@ -5,6 +5,7 @@ const { TdriveClient } = require('./TdriveClient');
 const { ManifestStore } = require('./ManifestStore');
 const { SyncEngine } = require('./SyncEngine');
 const { CryptoManager } = require('./CryptoManager');
+const { makeT, resolveLang } = require('./i18n');
 
 const VIEW_TYPE = 'tdrive-sync-status';
 
@@ -27,9 +28,18 @@ const DEFAULTS = {
   cellularMaxFileMB: 5,                // on cellular, defer files larger than this (0 = never defer)
   syncOnChange: false,                 // auto-sync shortly after a local edit
   syncOnChangeDelaySeconds: 5,         // debounce window for change-triggered syncs
+  mergeTextFiles: true,                // keep a small text base so conflicts can be auto-merged
+  streamLargeDownloads: true,          // write very large plaintext downloads straight to disk (bounded memory)
+  streamThresholdMB: 8,                // ...for files at least this large
+  incrementalScan: true,               // skip the remote tree walk when the server reports no changes
+  fullScanMinutes: 15,                 // ...but always do a full scan at least this often
+  remoteLock: true,                    // warn if another device is syncing right now
+  remoteLockMinutes: 15,               // a lock older than this is ignored
+  syncFolders: [],                     // selective sync: only these subtrees on this device (empty = everything)
   e2eeEnabled: false,                  // encrypt file contents before upload
   e2eePassphrase: '',
   e2eeSalt: '',
+  language: 'auto',                    // auto | ar | en
 };
 
 /** Best-effort cellular detection. Unknown -> false (allow), so a false positive can never block sync. */
@@ -57,7 +67,7 @@ async function obsidianTransport({ url, method, headers, body }) {
 }
 
 class ObsidianLocalFS {
-  constructor(app) { this.app = app; }
+  constructor(app, t) { this.app = app; this.t = t || ((s) => s); }
   get ad() { return this.app.vault.adapter; }
   async list() { return this.app.vault.getFiles().map((f) => ({ path: f.path, size: f.stat.size, mtime: f.stat.mtime })); }
   readBinary(p) { return this.ad.readBinary(p); }
@@ -82,8 +92,8 @@ class ObsidianLocalFS {
       // "already exists" while stat cannot confirm the folder: trust it unless something known to be a file is there.
       if (err && /exist/i.test(String(err.message || err)) && (await this.ad.exists(cur)) && !(await this._isFile(cur))) continue;
       if (err && !(await this._isDir(cur))) {
-        const clash = (await this.ad.exists(cur)) ? ' (يوجد ملف بنفس الاسم)' : '';
-        throw new Error('تعذر إنشاء المجلد المحلي "' + cur + '"' + clash + ': ' + (err.message || err));
+        const clash = (await this.ad.exists(cur)) ? this.t('local.nameClash') : '';
+        throw new Error(this.t('local.couldNotCreate', { dir: cur, clash, msg: (err.message || err) }));
       }
     }
   }
@@ -101,9 +111,9 @@ class ObsidianLocalFS {
       // Folder not yet known to the vault index, or the file already exists on disk but not in the index.
       await this._mkdirs(p);
       try { await this.ad.writeBinary(p, buf, opts); }
-      catch (e2) { throw new Error('تعذر كتابة الملف محليًا "' + p + '": ' + (e2.message || e.message)); }
+      catch (e2) { throw new Error(this.t('local.couldNotWrite', { path: p, msg: (e2.message || e.message) })); }
     }
-    if (!(await this.ad.exists(p))) throw new Error('الملف لم يظهر بعد الكتابة: ' + p);
+    if (!(await this.ad.exists(p))) throw new Error(this.t('local.notAppeared', { path: p }));
   }
   /** Folder paths known to the vault (null when the API is unavailable, so the engine skips folder deletion). */
   async listFolders() {
@@ -127,6 +137,21 @@ class ObsidianLocalFS {
     if (this.app.fileManager.trashFile) await this.app.fileManager.trashFile(f);
     else await this.app.vault.trash(f, true);
   }
+  /** True when the adapter can append bytes (enables streaming large downloads to disk). */
+  get canStream() { return typeof this.ad.appendBinary === 'function'; }
+  /** Opens a streaming sink at `p`: the first chunk overwrites, later chunks append. */
+  async beginStreamWrite(p) {
+    await this._mkdirs(p);
+    const self = this; let n = 0;
+    return {
+      async write(chunk) {
+        const buf = chunk instanceof ArrayBuffer ? chunk : (chunk.buffer ? chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength) : chunk);
+        if (n++ === 0) await self.ad.writeBinary(p, buf);
+        else await self.ad.appendBinary(p, buf);
+      },
+      async close() { return p; },
+    };
+  }
 }
 
 const fmtTime = (ms) => (ms ? new Date(ms).toLocaleString() : '—');
@@ -134,22 +159,23 @@ const fmtTime = (ms) => (ms ? new Date(ms).toLocaleString() : '—');
 class ConflictModal extends Modal {
   constructor(app, plugin, path) { super(app); this.plugin = plugin; this.path = path; }
   onOpen() {
-    const { contentEl } = this;
-    contentEl.createEl('h3', { text: 'تعارض في: ' + this.path });
+    const { contentEl } = this; const t = this.plugin.t;
+    contentEl.createEl('h3', { text: t('conflict.title', { path: this.path }) });
     const c = this.plugin.ledger.getConflict(this.path);
-    contentEl.createEl('p', { text: 'تغيّر الملف محليًا وعلى Tdrive منذ آخر مزامنة. النسخة البعيدة محفوظة محليًا باسم: ' + (c ? c.copyPath : '?') });
+    contentEl.createEl('p', { text: t('conflict.body', { copy: c ? c.copyPath : '?' }) });
     const opts = [
-      ['local', 'الاحتفاظ بالنسخة المحلية', 'يرفع المحلية، وتُنقل نسخة التعارض إلى سلة Obsidian. النسخة البعيدة القديمة تبقى في سلة Tdrive.'],
-      ['remote', 'الاحتفاظ بالنسخة البعيدة', 'تُحفظ نسختك المحلية باسم "local backup" ثم تُطبَّق النسخة البعيدة.'],
-      ['both', 'حفظ النسختين', 'تبقى المحلية في مكانها وتبقى نسخة التعارض كملف مستقل، وتُرفع المحلية.'],
-      ['cancel', 'إلغاء', 'لا تغيير؛ يبقى التعارض معلقًا.'],
+      ['merge', 'conflict.merge', 'conflict.mergeDesc'],
+      ['local', 'conflict.local', 'conflict.localDesc'],
+      ['remote', 'conflict.remote', 'conflict.remoteDesc'],
+      ['both', 'conflict.both', 'conflict.bothDesc'],
+      ['cancel', 'conflict.cancel', 'conflict.cancelDesc'],
     ];
-    for (const [key, label, desc] of opts) {
-      new Setting(contentEl).setName(label).setDesc(desc).addButton((b) => b.setButtonText(label).onClick(async () => {
+    for (const [key, labelKey, descKey] of opts) {
+      new Setting(contentEl).setName(t(labelKey)).setDesc(t(descKey)).addButton((b) => b.setButtonText(t(labelKey)).onClick(async () => {
         this.close();
         if (key === 'cancel') return;
-        try { await this.plugin.resolveConflict(this.path, key); new Notice('تم حل التعارض'); }
-        catch (e) { new Notice('تعذر حل التعارض: ' + this.plugin.redact(e.message), 8000); }
+        try { await this.plugin.resolveConflict(this.path, key); new Notice(t('conflict.resolved')); }
+        catch (e) { new Notice(t('conflict.resolveFailed', { msg: this.plugin.redact(e.message) }), 8000); }
       }));
     }
   }
@@ -159,14 +185,42 @@ class ConflictModal extends Modal {
 class ApproveDeletesModal extends Modal {
   constructor(app, plugin, pending) { super(app); this.plugin = plugin; this.pending = pending; }
   onOpen() {
-    const { contentEl } = this; const items = this.pending.items || [];
-    contentEl.createEl('h3', { text: `حذف معلّق (${items.length} ملف)` });
-    contentEl.createEl('p', { text: 'هذه الملفات حُذفت في جهة واحدة فقط، وسيُنقل نظيرها في الجهة الأخرى إلى السلة (قابل للاسترجاع). راجع القائمة قبل الموافقة.' });
+    const { contentEl } = this; const t = this.plugin.t; const items = this.pending.items || [];
+    contentEl.createEl('h3', { text: t('pending.title', { n: items.length }) });
+    contentEl.createEl('p', { text: t('pending.body') });
     const pre = contentEl.createEl('pre', { cls: 'tdrive-sync-log' });
-    pre.setText(items.slice(0, 60).map((i) => (i.action === 'deleteRemote' ? '☁ حذف من Tdrive: ' : '💻 حذف محلي: ') + i.path).join('\n') + (items.length > 60 ? `\n… و${items.length - 60} أخرى` : ''));
+    pre.setText(items.slice(0, 60).map((i) => (i.action === 'deleteRemote' ? t('pending.remoteItem') : t('pending.localItem')) + i.path).join('\n') + (items.length > 60 ? t('pending.more', { n: items.length - 60 }) : ''));
     const row = contentEl.createDiv({ cls: 'tdrive-sync-row' });
-    row.createEl('button', { text: 'موافقة وتنفيذ' }).onclick = () => { this.close(); this.plugin.runSync({ approveDeletes: true }); };
-    row.createEl('button', { text: 'إلغاء' }).onclick = () => this.close();
+    row.createEl('button', { text: t('pending.approve') }).onclick = () => { this.close(); this.plugin.runSync({ approveDeletes: true }); };
+    row.createEl('button', { text: t('common.cancel') }).onclick = () => this.close();
+  }
+  onClose() { this.contentEl.empty(); }
+}
+
+class PreviewModal extends Modal {
+  constructor(app, plugin, rep) { super(app); this.plugin = plugin; this.rep = rep; }
+  onOpen() {
+    const { contentEl } = this; const p = this.rep.plan || {}; const t = this.plugin.t;
+    contentEl.createEl('h3', { text: t('preview.title') });
+    const row = (labelKey, arr, fmt) => {
+      if (!arr || !arr.length) return;
+      contentEl.createEl('h4', { text: `${t(labelKey)} (${arr.length})` });
+      const pre = contentEl.createEl('pre', { cls: 'tdrive-sync-log' });
+      pre.setText(arr.slice(0, 50).map(fmt).join('\n') + (arr.length > 50 ? t('preview.more', { n: arr.length - 50 }) : ''));
+    };
+    row('lane.upload', p.upload, (x) => '↑ ' + x);
+    row('lane.download', p.download, (x) => '↓ ' + x);
+    row('lane.compare', p.compare, (x) => '⇅ ' + x);
+    row('lane.move', p.move, (x) => `→ ${x.from}  ⇒  ${x.to}`);
+    row('lane.deleteRemote', p.deleteRemote, (x) => '☁ ' + x);
+    row('lane.deleteLocal', p.deleteLocal, (x) => '💻 ' + x);
+    row('lane.blocked', p.blocked, (x) => `⊘ ${x.path} (${x.why})`);
+    row('lane.conflicts', p.skipConflict, (x) => '⚠ ' + x);
+    const total = ['upload', 'download', 'compare', 'move', 'deleteRemote', 'deleteLocal'].reduce((n, k) => n + ((p[k] && p[k].length) || 0), 0);
+    if (!total) contentEl.createEl('p', { text: t('preview.none') });
+    const bar = contentEl.createDiv({ cls: 'tdrive-sync-row' });
+    bar.createEl('button', { text: t('common.runNow') }).onclick = () => { this.close(); this.plugin.runSync(); };
+    bar.createEl('button', { text: t('common.close') }).onclick = () => this.close();
   }
   onClose() { this.contentEl.empty(); }
 }
@@ -180,37 +234,37 @@ class SyncStatusView extends ItemView {
   async onClose() { this.plugin.listeners.delete(this._h); }
   render() {
     const el = this.contentEl; el.empty(); el.addClass('tdrive-sync-view');
-    const p = this.plugin; const meta = p.ledger.data.meta; const last = meta.lastRun;
+    const p = this.plugin; const t = p.t; const meta = p.ledger.data.meta; const last = meta.lastRun;
     el.createEl('h3', { text: 'Tdrive Sync' });
     const box = el.createDiv({ cls: 'tdrive-sync-box' });
     const line = (k, v) => box.createDiv().setText(`${k}: ${v}`);
-    line('الاتصال', p.connection);
-    line('الحالة', p.settings.paused ? 'متوقفة مؤقتًا' : (p.engine && p.engine.running ? 'جارية' : 'خاملة'));
-    if (p.progress && p.engine && p.engine.running) line('التقدم', `${p.progress.done}/${p.progress.total} ${p.progress.current || ''}`);
-    line('آخر مزامنة ناجحة', fmtTime(meta.lastSuccessAt));
+    line(t('status.connection'), p.connection);
+    line(t('status.state'), p.settings.paused ? t('status.paused') : (p.engine && p.engine.running ? t('status.running') : t('status.idle')));
+    if (p.progress && p.engine && p.engine.running) line(t('status.progress'), `${p.progress.done}/${p.progress.total} ${p.progress.current || ''}`);
+    line(t('status.lastSuccess'), fmtTime(meta.lastSuccessAt));
     if (last) {
-      line('آخر تشغيل', `${fmtTime(last.at)} — ${last.status}`);
-      line('رُفع / نُزّل / تجاوز', `${last.uploaded} / ${last.downloaded} / ${last.skipped}`);
-      line('تعارضات / أخطاء', `${p.ledger.conflictKeys().length} / ${last.errors}`);
+      line(t('status.lastRun'), `${fmtTime(last.at)} — ${last.status}`);
+      line(t('status.counts'), `${last.uploaded} / ${last.downloaded} / ${last.skipped}`);
+      line(t('status.conflictsErrors'), `${p.ledger.conflictKeys().length} / ${last.errors}`);
     }
     const row = el.createDiv({ cls: 'tdrive-sync-row' });
-    row.createEl('button', { text: 'مزامنة الآن' }).onclick = () => p.runSync();
-    row.createEl('button', { text: p.settings.paused ? 'استئناف' : 'إيقاف مؤقت' }).onclick = () => (p.settings.paused ? p.resume() : p.pause());
-    row.createEl('button', { text: 'اختبار الاتصال' }).onclick = () => p.testConnection();
+    row.createEl('button', { text: t('status.syncNow') }).onclick = () => p.runSync();
+    row.createEl('button', { text: p.settings.paused ? t('status.resume') : t('status.pause') }).onclick = () => (p.settings.paused ? p.resume() : p.pause());
+    row.createEl('button', { text: t('status.testConn') }).onclick = () => p.testConnection();
     const pend = meta.blockedDeletes;
     if (pend && pend.items && pend.items.length) {
-      el.createEl('h4', { text: `حذف محجوب (${pend.items.length})` });
-      const why = { limit: 'تجاوز حد الحذف', 'empty-local': 'الـ Vault المحلي يبدو فارغًا', 'empty-remote': 'المجلد البعيد يبدو فارغًا' }[pend.reason] || pend.reason;
-      el.createDiv().setText(`السبب: ${why} — آخر فحص ${fmtTime(pend.at)}`);
-      if (pend.reason === 'limit') el.createEl('button', { text: 'مراجعة والموافقة…' }).onclick = () => new ApproveDeletesModal(p.app, p, pend).open();
+      el.createEl('h4', { text: t('status.blockedDeletes', { n: pend.items.length }) });
+      const why = { limit: t('status.reasonLimit'), 'empty-local': t('status.reasonEmptyLocal'), 'empty-remote': t('status.reasonEmptyRemote') }[pend.reason] || pend.reason;
+      el.createDiv().setText(t('status.reason', { why, at: fmtTime(pend.at) }));
+      if (pend.reason === 'limit') el.createEl('button', { text: t('common.reviewApprove') }).onclick = () => new ApproveDeletesModal(p.app, p, pend).open();
     }
     const cs = p.ledger.conflictKeys();
-    el.createEl('h4', { text: `التعارضات (${cs.length})` });
+    el.createEl('h4', { text: t('status.conflicts', { n: cs.length }) });
     for (const path of cs) {
       const r = el.createDiv({ cls: 'tdrive-sync-row' }); r.createSpan({ text: path });
-      r.createEl('button', { text: 'حل…' }).onclick = () => new ConflictModal(p.app, p, path).open();
+      r.createEl('button', { text: t('status.resolve') }).onclick = () => new ConflictModal(p.app, p, path).open();
     }
-    el.createEl('h4', { text: 'سجل المزامنة' });
+    el.createEl('h4', { text: t('status.log') });
     const pre = el.createEl('pre', { cls: 'tdrive-sync-log' });
     pre.setText(p.ledger.data.log.slice(-100).reverse().map((l) => `${new Date(l.t).toLocaleTimeString()} [${l.level}] ${l.msg}`).join('\n'));
   }
@@ -219,116 +273,132 @@ class SyncStatusView extends ItemView {
 class TdriveSettingTab extends PluginSettingTab {
   constructor(app, plugin) { super(app, plugin); this.plugin = plugin; }
   display() {
-    const { containerEl } = this; const p = this.plugin; const s = p.settings;
+    const { containerEl } = this; const p = this.plugin; const s = p.settings; const t = p.t;
     containerEl.empty();
     containerEl.createEl('h2', { text: 'Tdrive Sync' });
-    containerEl.createEl('p', { cls: 'mod-warning', text: 'تنبيه أمني: يُحفظ مفتاح API كنص عادي في ملف data.json داخل مجلد الإضافة. استخدم مفتاحًا مخصصًا لهذه الإضافة يمكن إلغاؤه من Tdrive، ولا تشارك مجلد .obsidian أو تضعه في مستودع عام.' });
-    new Setting(containerEl).setName('عنوان خادم Tdrive').addText((t) => t.setValue(s.baseUrl).onChange(async (v) => { s.baseUrl = v.trim(); await p.saveSettings(); }));
-    new Setting(containerEl).setName('API Key').setDesc('يبدأ عادةً بـ tdk_ — يُرسل فقط إلى عنوان الخادم أعلاه.')
-      .addText((t) => { t.inputEl.type = 'password'; t.setValue(s.apiKey).onChange(async (v) => { s.apiKey = v.trim(); await p.saveSettings(); }); });
-    new Setting(containerEl).setName('المجلد البعيد').setDesc('مثال: /Obsidian/MyVault/ — إن تُرك فارغًا يُستخدم /Obsidian/<اسم الـ Vault>/')
-      .addText((t) => t.setPlaceholder(p.defaultRemoteFolder()).setValue(s.remoteFolder).onChange(async (v) => { s.remoteFolder = v.trim(); await p.saveSettings(); }));
-    new Setting(containerEl).setName('نمط المزامنة').addDropdown((d) => d
-      .addOptions({ 'two-way': 'ثنائية الاتجاه', 'upload-only': 'رفع فقط', 'download-only': 'تنزيل فقط' })
+    new Setting(containerEl).setName(t('settings.language'))
+      .addDropdown((d) => d.addOptions({ auto: t('settings.languageAuto'), ar: 'العربية', en: 'English' }).setValue(s.language)
+        .onChange(async (v) => { s.language = v; p.applyLanguage(); await p.saveSettings(); this.display(); }));
+    containerEl.createEl('p', { cls: 'mod-warning', text: t('security.warning') });
+    new Setting(containerEl).setName(t('settings.server')).addText((el) => el.setValue(s.baseUrl).onChange(async (v) => { s.baseUrl = v.trim(); await p.saveSettings(); }));
+    new Setting(containerEl).setName(t('settings.apiKey')).setDesc(t('settings.apiKeyDesc'))
+      .addText((el) => { el.inputEl.type = 'password'; el.setValue(s.apiKey).onChange(async (v) => { s.apiKey = v.trim(); await p.saveSettings(); }); });
+    new Setting(containerEl).setName(t('settings.remoteFolder')).setDesc(t('settings.remoteFolderDesc'))
+      .addText((el) => el.setPlaceholder(p.defaultRemoteFolder()).setValue(s.remoteFolder).onChange(async (v) => { s.remoteFolder = v.trim(); await p.saveSettings(); }));
+    new Setting(containerEl).setName(t('settings.mode')).addDropdown((d) => d
+      .addOptions({ 'two-way': t('settings.modeTwo'), 'upload-only': t('settings.modeUp'), 'download-only': t('settings.modeDown') })
       .setValue(s.mode).onChange(async (v) => { s.mode = v; await p.saveSettings(); }));
-    new Setting(containerEl).setName('سياسة الحذف').setDesc('"سلة": الحذف يُنقل إلى سلة Tdrive / سلة Obsidian (قابل للاسترجاع). "إيقاف": لا يُحذف شيء أبدًا.')
-      .addDropdown((d) => d.addOptions({ trash: 'نقل إلى السلة', off: 'إيقاف الحذف' }).setValue(s.deletionPolicy).onChange(async (v) => { s.deletionPolicy = v; await p.saveSettings(); }));
-    new Setting(containerEl).setName('حد الحذف لكل مزامنة').setDesc('إن تجاوز عدد الحذف هذا الحد تُحجب كل عمليات الحذف.')
-      .addText((t) => t.setValue(String(s.maxDeletesPerRun)).onChange(async (v) => { const n = parseInt(v, 10); if (n >= 0) { s.maxDeletesPerRun = n; await p.saveSettings(); } }));
-    new Setting(containerEl).setName('المزامنة التلقائية (بالدقائق)').setDesc('0 = معطلة. تعمل فقط أثناء فتح التطبيق (قيد من Obsidian، خاصة على أندرويد).')
-      .addText((t) => t.setValue(String(s.autoSyncMinutes)).onChange(async (v) => { const n = parseInt(v, 10); if (n >= 0) { s.autoSyncMinutes = n; await p.saveSettings(); p.setupAutoSync(); } }));
-    new Setting(containerEl).setName('مزامنة عند فتح التطبيق').addToggle((t) => t.setValue(s.syncOnStartup).onChange(async (v) => { s.syncOnStartup = v; await p.saveSettings(); }));
-    new Setting(containerEl).setName('استثناءات (نمط في كل سطر)').setDesc('المجلدات والملفات المخفية (.obsidian و .git ...) مستثناة دائمًا. مثال: Private/**')
-      .addTextArea((t) => t.setValue(s.excludePatterns.join('\n')).onChange(async (v) => { s.excludePatterns = v.split('\n').map((x) => x.trim()).filter(Boolean); await p.saveSettings(); }));
-    containerEl.createEl('h3', { text: 'الأداء' });
-    new Setting(containerEl).setName('حجم جزء الرفع (MB)').setDesc('0 = تلقائي. ملاحظة: بعض الخوادم (Tdrive) تفرض حجم الجزء الخاص بها في جلسة الرفع، فيُستخدم حجم الخادم تلقائيًا عندها.')
-      .addText((t) => t.setValue(String(s.uploadChunkBytes ? s.uploadChunkBytes / 1048576 : 0)).onChange(async (v) => {
+    new Setting(containerEl).setName(t('settings.deletion')).setDesc(t('settings.deletionDesc'))
+      .addDropdown((d) => d.addOptions({ trash: t('settings.deletionTrash'), off: t('settings.deletionOff') }).setValue(s.deletionPolicy).onChange(async (v) => { s.deletionPolicy = v; await p.saveSettings(); }));
+    new Setting(containerEl).setName(t('settings.maxDeletes')).setDesc(t('settings.maxDeletesDesc'))
+      .addText((el) => el.setValue(String(s.maxDeletesPerRun)).onChange(async (v) => { const n = parseInt(v, 10); if (n >= 0) { s.maxDeletesPerRun = n; await p.saveSettings(); } }));
+    new Setting(containerEl).setName(t('settings.autoSync')).setDesc(t('settings.autoSyncDesc'))
+      .addText((el) => el.setValue(String(s.autoSyncMinutes)).onChange(async (v) => { const n = parseInt(v, 10); if (n >= 0) { s.autoSyncMinutes = n; await p.saveSettings(); p.setupAutoSync(); } }));
+    new Setting(containerEl).setName(t('settings.syncOnStartup')).addToggle((el) => el.setValue(s.syncOnStartup).onChange(async (v) => { s.syncOnStartup = v; await p.saveSettings(); }));
+    new Setting(containerEl).setName(t('settings.exclude')).setDesc(t('settings.excludeDesc'))
+      .addTextArea((el) => el.setValue(s.excludePatterns.join('\n')).onChange(async (v) => { s.excludePatterns = v.split('\n').map((x) => x.trim()).filter(Boolean); await p.saveSettings(); }));
+    new Setting(containerEl).setName(t('settings.selective')).setDesc(t('settings.selectiveDesc'))
+      .addTextArea((el) => el.setValue(s.syncFolders.join('\n')).onChange(async (v) => { s.syncFolders = v.split('\n').map((x) => x.trim()).filter(Boolean); await p.saveSettings(); }));
+    new Setting(containerEl).setName(t('settings.merge')).setDesc(t('settings.mergeDesc'))
+      .addToggle((el) => el.setValue(s.mergeTextFiles).onChange(async (v) => { s.mergeTextFiles = v; await p.saveSettings(); }));
+    new Setting(containerEl).setName(t('settings.stream')).setDesc(t('settings.streamDesc'))
+      .addToggle((el) => el.setValue(s.streamLargeDownloads).onChange(async (v) => { s.streamLargeDownloads = v; await p.saveSettings(); }));
+    new Setting(containerEl).setName(t('settings.remoteLock')).setDesc(t('settings.remoteLockDesc'))
+      .addToggle((el) => el.setValue(s.remoteLock).onChange(async (v) => { s.remoteLock = v; await p.saveSettings(); }));
+
+    containerEl.createEl('h3', { text: t('sec.performance') });
+    new Setting(containerEl).setName(t('settings.uploadChunk')).setDesc(t('settings.uploadChunkDesc'))
+      .addText((el) => el.setValue(String(s.uploadChunkBytes ? s.uploadChunkBytes / 1048576 : 0)).onChange(async (v) => {
         const n = parseFloat(v); if (!Number.isFinite(n) || n < 0) return;
         s.uploadChunkBytes = n === 0 ? 0 : Math.round(Math.min(5, Math.max(0.25, n)) * 1048576); await p.saveSettings();
       }));
-    new Setting(containerEl).setName('حجم جزء التنزيل (MB)').setDesc('افتراضي 4. الأجزاء تُنزَّل بالتوازي عند دعم الخادم.')
-      .addText((t) => t.setValue(String(Math.round(s.downloadChunkBytes / 1048576))).onChange(async (v) => {
+    new Setting(containerEl).setName(t('settings.downloadChunk')).setDesc(t('settings.downloadChunkDesc'))
+      .addText((el) => el.setValue(String(Math.round(s.downloadChunkBytes / 1048576))).onChange(async (v) => {
         const n = parseFloat(v); if (!Number.isFinite(n) || n <= 0) return;
         s.downloadChunkBytes = Math.round(Math.min(5, Math.max(1, n)) * 1048576); await p.saveSettings();
       }));
-    new Setting(containerEl).setName('عدد الأجزاء المتوازية').setDesc('1 = تسلسلي. 3-4 يسرّع الملفات الكبيرة كثيرًا.')
-      .addText((t) => t.setValue(String(s.maxConcurrentParts)).onChange(async (v) => {
+    new Setting(containerEl).setName(t('settings.parallel')).setDesc(t('settings.parallelDesc'))
+      .addText((el) => el.setValue(String(s.maxConcurrentParts)).onChange(async (v) => {
         const n = parseInt(v, 10); if (!Number.isFinite(n)) return;
         s.maxConcurrentParts = Math.min(6, Math.max(1, n)); await p.saveSettings();
       }));
-    new Setting(containerEl).setName('أقصى حجم ملف (MB)').setDesc('0 = بلا حد. تُتجاهل الملفات الأكبر (فيديو مثلًا) فلا تُرفع ولا تُنزَّل.')
-      .addText((t) => t.setValue(String(s.maxFileSizeMB)).onChange(async (v) => {
+    new Setting(containerEl).setName(t('settings.maxFile')).setDesc(t('settings.maxFileDesc'))
+      .addText((el) => el.setValue(String(s.maxFileSizeMB)).onChange(async (v) => {
         const n = parseFloat(v); if (!Number.isFinite(n) || n < 0) return;
         s.maxFileSizeMB = Math.round(n); await p.saveSettings();
       }));
 
-    containerEl.createEl('h3', { text: 'الشبكة' });
-    new Setting(containerEl).setName('Wi-Fi فقط').setDesc('عند اكتشاف اتصال خلوي، تُعالج التغييرات المحلية فقط دون نقل بيانات عبر الشبكة.')
-      .addToggle((t) => t.setValue(s.wifiOnly).onChange(async (v) => { s.wifiOnly = v; await p.saveSettings(); }));
-    new Setting(containerEl).setName('تأجيل الملفات الكبيرة على الشبكة الخلوية (MB)').setDesc('عند اتصال خلوي (وبدون "Wi-Fi فقط") تُؤجَّل الملفات الأكبر من هذا الحجم. 0 = لا تأجيل.')
-      .addText((t) => t.setValue(String(s.cellularMaxFileMB)).onChange(async (v) => {
+    containerEl.createEl('h3', { text: t('sec.network') });
+    new Setting(containerEl).setName(t('settings.wifiOnly')).setDesc(t('settings.wifiOnlyDesc'))
+      .addToggle((el) => el.setValue(s.wifiOnly).onChange(async (v) => { s.wifiOnly = v; await p.saveSettings(); }));
+    new Setting(containerEl).setName(t('settings.cellularMax')).setDesc(t('settings.cellularMaxDesc'))
+      .addText((el) => el.setValue(String(s.cellularMaxFileMB)).onChange(async (v) => {
         const n = parseFloat(v); if (!Number.isFinite(n) || n < 0) return;
         s.cellularMaxFileMB = Math.round(n); await p.saveSettings();
       }));
 
-    containerEl.createEl('h3', { text: 'المزامنة عند التغيير' });
-    new Setting(containerEl).setName('مزامنة تلقائية عند التعديل').setDesc('تشغّل مزامنة بعد فترة قصيرة من آخر تعديل محلي.')
-      .addToggle((t) => t.setValue(s.syncOnChange).onChange(async (v) => { s.syncOnChange = v; await p.saveSettings(); }));
-    new Setting(containerEl).setName('مهلة التأخير (ثوانٍ)').setDesc('تُجمَّع التعديلات المتتابعة ثم تُزامَن مرة واحدة.')
-      .addText((t) => t.setValue(String(s.syncOnChangeDelaySeconds)).onChange(async (v) => {
+    containerEl.createEl('h3', { text: t('sec.change') });
+    new Setting(containerEl).setName(t('settings.syncOnChange')).setDesc(t('settings.syncOnChangeDesc'))
+      .addToggle((el) => el.setValue(s.syncOnChange).onChange(async (v) => { s.syncOnChange = v; await p.saveSettings(); }));
+    new Setting(containerEl).setName(t('settings.syncOnChangeDelay')).setDesc(t('settings.syncOnChangeDelayDesc'))
+      .addText((el) => el.setValue(String(s.syncOnChangeDelaySeconds)).onChange(async (v) => {
         const n = parseInt(v, 10); if (!Number.isFinite(n)) return;
         s.syncOnChangeDelaySeconds = Math.min(300, Math.max(2, n)); await p.saveSettings();
       }));
 
-    containerEl.createEl('h3', { text: 'التشفير من طرف العميل (E2EE)' });
-    containerEl.createEl('p', { cls: 'mod-warning', text: 'عند التفعيل تُشفَّر محتويات الملفات قبل رفعها (AES-256-GCM). الخادم لا يرى إلا نصًّا مشفَّرًا. أسماء الملفات والمجلدات تبقى ظاهرة. استخدم عبارة مرور طويلة وفريدة (16 حرفًا+)؛ لا يمكن استرجاع الملفات إن فقدتها، ويجب أن تكون العبارة نفسها على كل الأجهزة.' });
-    new Setting(containerEl).setName('تفعيل التشفير').setDesc('يُطبَّق على الملفات التي تُرفع بعد التفعيل. الملفات القديمة غير المشفّرة تُنزَّل كما هي.')
-      .addToggle((t) => t.setValue(s.e2eeEnabled).onChange(async (v) => { s.e2eeEnabled = v; await p.saveSettings(); }));
-    new Setting(containerEl).setName('عبارة المرور').setDesc('تُحفظ نصًّا عاديًا في data.json — لا تشارك مجلد .obsidian.')
-      .addText((t) => { t.inputEl.type = 'password'; t.setValue(s.e2eePassphrase).onChange(async (v) => { s.e2eePassphrase = v; await p.saveSettings(); }); });
-    new Setting(containerEl).setName('بذرة التشفير (متقدّم)').setDesc('اتركها فارغة للقيمة الافتراضية. غيّرها فقط إن أردت مفتاحًا خاصًّا، ويجب أن تتطابق على كل الأجهزة.')
-      .addText((t) => t.setValue(s.e2eeSalt).onChange(async (v) => { s.e2eeSalt = v.trim(); await p.saveSettings(); }));
+    containerEl.createEl('h3', { text: t('sec.e2ee') });
+    containerEl.createEl('p', { cls: 'mod-warning', text: t('e2ee.warning') });
+    new Setting(containerEl).setName(t('settings.e2eeEnable')).setDesc(t('settings.e2eeEnableDesc'))
+      .addToggle((el) => el.setValue(s.e2eeEnabled).onChange(async (v) => { s.e2eeEnabled = v; await p.saveSettings(); }));
+    new Setting(containerEl).setName(t('settings.e2eePass')).setDesc(t('settings.e2eePassDesc'))
+      .addText((el) => { el.inputEl.type = 'password'; el.setValue(s.e2eePassphrase).onChange(async (v) => { s.e2eePassphrase = v; await p.saveSettings(); }); });
+    new Setting(containerEl).setName(t('settings.e2eeSalt')).setDesc(t('settings.e2eeSaltDesc'))
+      .addText((el) => el.setValue(s.e2eeSalt).onChange(async (v) => { s.e2eeSalt = v.trim(); await p.saveSettings(); }));
 
-    containerEl.createEl('h3', { text: 'الاتصال والسجل' });
-    new Setting(containerEl).setName('اختبار الاتصال').addButton((b) => b.setButtonText('اختبار').onClick(() => p.testConnection()));
-    new Setting(containerEl).setName('الحالة والسجل').addButton((b) => b.setButtonText('فتح').onClick(() => p.activateView()));
-    new Setting(containerEl).setName('تصدير السجل إلى ملف').setDesc('يكتب سجل المزامنة في ملف نصي داخل مجلد الإضافة لإرفاقه عند الإبلاغ عن مشكلة.')
-      .addButton((b) => b.setButtonText('تصدير').onClick(() => p.exportLog()));
-    new Setting(containerEl).setName('إيقاف / استئناف المزامنة').addButton((b) => b.setButtonText(s.paused ? 'استئناف' : 'إيقاف').onClick(async () => { await (s.paused ? p.resume() : p.pause()); this.display(); }));
-    new Setting(containerEl).setName('فحص شكل استجابات API').setDesc('يعرض أسماء الحقول التي ترجعها Tdrive (بدون محتوى ملفاتك) ضمن السجل — مفيد للإبلاغ عن مشاكل التوافق.')
-      .addButton((b) => b.setButtonText('فحص').onClick(() => p.probeApi()));
+    containerEl.createEl('h3', { text: t('sec.connection') });
+    new Setting(containerEl).setName(t('settings.testConn')).addButton((b) => b.setButtonText(t('common.test')).onClick(() => p.testConnection()));
+    new Setting(containerEl).setName(t('settings.statusLog')).addButton((b) => b.setButtonText(t('common.open')).onClick(() => p.activateView()));
+    new Setting(containerEl).setName(t('settings.exportLog')).setDesc(t('settings.exportLogDesc'))
+      .addButton((b) => b.setButtonText(t('common.export')).onClick(() => p.exportLog()));
+    new Setting(containerEl).setName(t('settings.pauseResume')).addButton((b) => b.setButtonText(s.paused ? t('status.resume') : t('status.pause')).onClick(async () => { await (s.paused ? p.resume() : p.pause()); this.display(); }));
+    new Setting(containerEl).setName(t('settings.probe')).setDesc(t('settings.probeDesc'))
+      .addButton((b) => b.setButtonText(t('common.test')).onClick(() => p.probeApi()));
   }
 }
 
 class TdriveSyncPlugin extends Plugin {
   async onload() {
-    this.listeners = new Set(); this.progress = null; this.engine = null; this.connection = 'لم يُختبر بعد';
+    this.listeners = new Set(); this.progress = null; this.engine = null; this.connection = '—';
     this._timer = null; this._changeTimer = null; this._quietUntil = 0; this._crypto = null; this._cryptoTag = '';
     this.settings = Object.assign({}, DEFAULTS, await this.loadData());
+    this.applyLanguage();
+    this.connection = this.t('status.idle');
     const ad = this.app.vault.adapter; const statePath = this.manifest.dir + '/sync-state.json';
     this.ledger = new ManifestStore({
       read: async () => ((await ad.exists(statePath)) ? ad.read(statePath) : null),
       write: (s) => ad.write(statePath, s),
     });
     await this.ledger.load();
-    this.local = new ObsidianLocalFS(this.app);
+    this.local = new ObsidianLocalFS(this.app, this.t);
 
     this.registerView(VIEW_TYPE, (leaf) => new SyncStatusView(leaf, this));
     this.addSettingTab(new TdriveSettingTab(this.app, this));
-    this.addRibbonIcon('refresh-cw', 'Tdrive Sync: Sync Now', () => this.runSync());
+    this.addRibbonIcon('refresh-cw', 'Tdrive Sync: ' + this.t('cmd.syncNow'), () => this.runSync());
     this.statusEl = this.addStatusBarItem();
-    const cmd = (id, name, cb) => this.addCommand({ id, name: 'Tdrive Sync: ' + name, callback: cb });
-    cmd('test-connection', 'Test Connection', () => this.testConnection());
-    cmd('sync-now', 'Sync Now', () => this.runSync());
-    cmd('upload-current-file', 'Upload Current File', () => this.uploadCurrent());
-    cmd('download-remote-changes', 'Download Remote Changes', () => this.runSync({ mode: 'download-only' }));
-    cmd('clean-empty-remote-folders', 'Clean Empty Remote Folders', () => this.cleanEmptyRemoteFolders());
-    cmd('approve-deletes', 'Approve Pending Deletions', () => this.approveDeletes());
-    cmd('view-conflicts', 'View Conflicts', () => this.activateView());
-    cmd('view-sync-log', 'View Sync Log', () => this.activateView());
-    cmd('export-log', 'Export Sync Log…', () => this.exportLog());
-    cmd('pause-sync', 'Pause Sync', () => this.pause());
-    cmd('resume-sync', 'Resume Sync', () => this.resume());
+    const cmd = (id, key, cb, opts) => this.addCommand({ id, name: 'Tdrive Sync: ' + this.t(key), callback: cb, ...(opts || {}) });
+    cmd('test-connection', 'cmd.testConnection', () => this.testConnection());
+    cmd('sync-now', 'cmd.syncNow', () => this.runSync());
+    cmd('upload-current-file', 'cmd.uploadCurrent', () => this.uploadCurrent());
+    cmd('download-remote-changes', 'cmd.downloadRemote', () => this.runSync({ mode: 'download-only' }));
+    cmd('clean-empty-remote-folders', 'cmd.cleanEmpty', () => this.cleanEmptyRemoteFolders());
+    cmd('approve-deletes', 'cmd.approveDeletes', () => this.approveDeletes());
+    cmd('restore-deletes', 'cmd.restoreDeletes', () => this.restoreDeletes());
+    cmd('preview-sync', 'cmd.preview', () => this.previewSync());
+    cmd('view-conflicts', 'cmd.viewConflicts', () => this.activateView());
+    cmd('view-sync-log', 'cmd.viewLog', () => this.activateView());
+    cmd('export-log', 'cmd.exportLog', () => this.exportLog());
+    cmd('pause-sync', 'cmd.pause', () => this.pause());
+    cmd('resume-sync', 'cmd.resume', () => this.resume());
     this.registerChangeSync();
     this.setupAutoSync(); this.refreshStatus();
     if (this.settings.syncOnStartup) this.app.workspace.onLayoutReady(() => window.setTimeout(() => this.runSync({ silent: true }), 5000));
@@ -339,6 +409,9 @@ class TdriveSyncPlugin extends Plugin {
     if (this._changeTimer) window.clearTimeout(this._changeTimer);
     if (this.engine) this.engine.pause();
   }
+
+  /** (Re)computes the translation function from the language setting. */
+  applyLanguage() { this.lang = resolveLang(this.settings.language); this.t = makeT(this.lang); if (this.local) this.local.t = this.t; }
 
   /** Debounced auto-sync on local edits (opt-in). Sync's own writes are ignored via the running flag and a
    *  short quiet window after each run, so a sync never re-triggers itself in a loop. */
@@ -363,26 +436,26 @@ class TdriveSyncPlugin extends Plugin {
   }
 
   defaultRemoteFolder() { return '/Obsidian/' + this.app.vault.getName() + '/'; }
-  redact(t) { return this.engine ? this.engine.client.redact(t) : String(t).replace(/tdk_[A-Za-z0-9_\-]+/g, 'tdk_***'); }
+  redact(str) { return this.engine ? this.engine.client.redact(str) : String(str).replace(/tdk_[A-Za-z0-9_\-]+/g, 'tdk_***'); }
   async saveSettings() { await this.saveData(this.settings); }
   notify() { this.listeners.forEach((h) => { try { h(); } catch (e) { /* view gone */ } }); this.refreshStatus(); }
 
   refreshStatus() {
     if (!this.statusEl) return;
     const m = this.ledger.data.meta; const c = this.ledger.conflictKeys().length;
-    let t = 'Tdrive: ';
-    if (this.settings.paused) t += 'متوقفة';
+    let txt = 'Tdrive: ';
+    if (this.settings.paused) txt += this.t('status.paused');
     else if (this.engine && this.engine.running && this.progress) {
       const pr = this.progress;
       if (pr.bytes && pr.bytes.total) {
         const pct = Math.min(100, Math.floor((pr.bytes.done / pr.bytes.total) * 100));
         const label = { upload: '↑', download: '↓', compare: '⇅' }[pr.action] || '';
-        t += `${label}${pct}%`;
-      } else t += `${pr.done || 0}/${pr.total || 0}`;
-    } else if (m.lastRun && m.lastRun.status !== 'ok') t += m.lastRun.status;
-    else t += m.lastSuccessAt ? 'متزامنة' : '—';
-    if (c) t += ` ⚠${c}`;
-    this.statusEl.setText(t);
+        txt += `${label}${pct}%`;
+      } else txt += `${pr.done || 0}/${pr.total || 0}`;
+    } else if (m.lastRun && m.lastRun.status !== 'ok') txt += m.lastRun.status;
+    else txt += m.lastSuccessAt ? this.t('status.synced') : '—';
+    if (c) txt += ` ⚠${c}`;
+    this.statusEl.setText(txt);
   }
 
   makeClient() {
@@ -410,6 +483,7 @@ class TdriveSyncPlugin extends Plugin {
       remoteFolder: this.settings.remoteFolder || this.defaultRemoteFolder(),
       maxFileBytes: this.settings.maxFileSizeMB > 0 ? this.settings.maxFileSizeMB * 1024 * 1024 : 0,
       cellularMaxFileBytes: this.settings.cellularMaxFileMB > 0 ? this.settings.cellularMaxFileMB * 1024 * 1024 : 0,
+      streamThresholdBytes: this.settings.streamThresholdMB > 0 ? this.settings.streamThresholdMB * 1024 * 1024 : 8 * 1024 * 1024,
       networkIsCellular: networkLooksCellular,
     });
     let lastTick = 0;
@@ -426,26 +500,26 @@ class TdriveSyncPlugin extends Plugin {
       await client.me(); const lim = await client.limits();
       let part = null;
       try { part = await client.uploadChunkSize(); } catch (e) { /* optional */ }
-      this.connection = `متصل ✓ (${new Date().toLocaleTimeString()}) — حجم الجزء ${Math.round((part || lim.chunkBytes) / 1024)} KB`;
-      new Notice('Tdrive: الاتصال ناجح');
+      this.connection = `✓ ${new Date().toLocaleTimeString()} — ${Math.round((part || lim.chunkBytes) / 1024)} KB`;
+      new Notice(this.t('notice.connectionOk'));
     } catch (e) {
-      this.connection = 'فشل: ' + this.redact(e.message);
-      new Notice('Tdrive: فشل الاتصال — ' + this.redact(e.message), 8000);
+      this.connection = '✗ ' + this.redact(e.message);
+      new Notice(this.t('notice.connectionFail', { msg: this.redact(e.message) }), 8000);
     }
     this.notify();
   }
 
   async runSync(opts = {}) {
-    if (this.settings.paused) { if (!opts.silent) new Notice('المزامنة متوقفة مؤقتًا'); return null; }
-    if (!this.settings.apiKey) { if (!opts.silent) new Notice('أدخل API Key في إعدادات Tdrive Sync'); return null; }
-    if (this.engine && this.engine.running) { if (!opts.silent) new Notice('مزامنة جارية بالفعل'); return null; }
+    if (this.settings.paused) { if (!opts.silent) new Notice(this.t('notice.paused')); return null; }
+    if (!this.settings.apiKey) { if (!opts.silent) new Notice(this.t('notice.noApiKey')); return null; }
+    if (this.engine && this.engine.running) { if (!opts.silent) new Notice(this.t('notice.busy')); return null; }
     let rep;
     try { rep = await this.makeEngine().syncNow(opts); }
     catch (e) { new Notice('Tdrive: ' + this.redact(e.message), 8000); this.notify(); return null; }
-    const msg = `↑${rep.uploaded} ↓${rep.downloaded} =${rep.skipped} ⚠${rep.conflicts} ✗${rep.errors}`;
-    if (rep.blockedDeletes && rep.blockedDeletes.items.length && !opts.silent) new Notice(`Tdrive: حُجب حذف ${rep.blockedDeletes.items.length} ملف (${rep.blockedDeletes.reason}). راجعها من أمر "Approve Pending Deletions".`, 10000);
-    if (rep.status === 'ok') { if (!opts.silent) new Notice('Tdrive: اكتملت المزامنة ' + msg); }
-    else new Notice(`Tdrive: لم تكتمل المزامنة (${rep.status}) ${msg}` + (rep.failures[0] ? '\n' + rep.failures[0].error : ''), 10000);
+    const msg = `↑${rep.uploaded} ↓${rep.downloaded} ⇄${rep.moved} =${rep.skipped} ⚠${rep.conflicts} ✗${rep.errors}`;
+    if (rep.blockedDeletes && rep.blockedDeletes.items.length && !opts.silent) new Notice(this.t('notice.blockedDeletes', { n: rep.blockedDeletes.items.length, reason: rep.blockedDeletes.reason }), 10000);
+    if (rep.status === 'ok') { if (!opts.silent) new Notice(this.t('notice.synced', { msg })); }
+    else new Notice(this.t('notice.failed', { status: rep.status, msg }) + (rep.failures[0] ? '\n' + rep.failures[0].error : ''), 10000);
     this._quietUntil = Date.now() + 3000;   // ignore our own writes firing vault events right after
     // Remember the server's real part size so the next run does not re-open a probe session.
     const ch = this.engine && this.engine.client && this.engine.client._uploadChunk;
@@ -473,32 +547,59 @@ class TdriveSyncPlugin extends Plugin {
       const body = this.ledger.data.log.map((l) => `${new Date(l.t).toISOString()} [${l.level}] ${l.msg}`).join('\n');
       const path = this.manifest.dir + '/tdrive-sync-log.txt';
       await this.app.vault.adapter.write(path, this.redact(head + '\n' + body + '\n'));
-      new Notice('تم تصدير السجل إلى: ' + path, 8000);
-    } catch (e) { new Notice('تعذر تصدير السجل: ' + this.redact(e.message), 8000); }
+      new Notice(this.t('notice.logExported', { path }), 8000);
+    } catch (e) { new Notice(this.t('notice.logExportFailed', { msg: this.redact(e.message) }), 8000); }
+  }
+
+  /** Computes what a sync would do and shows it without changing anything. */
+  async previewSync() {
+    if (this.settings.paused) { new Notice(this.t('notice.paused')); return; }
+    if (!this.settings.apiKey) { new Notice(this.t('notice.noApiKey')); return; }
+    if (this.engine && this.engine.running) { new Notice(this.t('notice.busy')); return; }
+    try {
+      const rep = await this.makeEngine().syncNow({ dryRun: true });
+      new PreviewModal(this.app, this, rep).open();
+    } catch (e) { new Notice('Tdrive: ' + this.redact(e.message), 8000); }
+  }
+
+  /** Restores the remote files deleted by the most recent sync from the Tdrive trash. */
+  async restoreDeletes() {
+    if (!this.settings.apiKey) { new Notice(this.t('notice.noApiKey')); return; }
+    if (this.engine && this.engine.running) { new Notice(this.t('notice.busy')); return; }
+    const audit = (this.ledger.data.meta.deletions || []);
+    if (!audit.length) { new Notice(this.t('notice.noDeletes')); return; }
+    try {
+      const rep = await (this.engine || this.makeEngine()).restoreLastDeletions();
+      let m = this.t('notice.restored', { restored: rep.restored });
+      if (rep.failed) m += this.t('notice.restoredFailed', { failed: rep.failed });
+      if (rep.skipped) m += this.t('notice.restoredSkipped', { skipped: rep.skipped });
+      new Notice(m, 10000);
+    } catch (e) { new Notice('Tdrive: ' + this.redact(e.message), 8000); }
+    this.notify();
   }
 
   approveDeletes() {
     const pend = this.ledger.data.meta.blockedDeletes;
-    if (!pend || !pend.items || !pend.items.length) { new Notice('لا يوجد حذف معلّق. شغّل المزامنة أولًا.'); return; }
-    if (pend.reason !== 'limit') { new Notice('الحذف محجوب لسبب لا يُتجاوز بالموافقة: ' + pend.reason, 8000); return; }
+    if (!pend || !pend.items || !pend.items.length) { new Notice(this.t('notice.noPendingDeletes')); return; }
+    if (pend.reason !== 'limit') { new Notice(this.t('notice.deleteBlockedReason', { reason: pend.reason }), 8000); return; }
     new ApproveDeletesModal(this.app, this, pend).open();
   }
 
   /** One-off cleanup of empty folders that older versions left on Tdrive (they never deleted folders). */
   async cleanEmptyRemoteFolders() {
-    if (!this.settings.apiKey) { new Notice('أدخل API Key في إعدادات Tdrive Sync'); return; }
-    if (this.engine && this.engine.running) { new Notice('مزامنة جارية بالفعل'); return; }
+    if (!this.settings.apiKey) { new Notice(this.t('notice.noApiKey')); return; }
+    if (this.engine && this.engine.running) { new Notice(this.t('notice.busy')); return; }
     try {
       const rep = await this.makeEngine().cleanEmptyRemoteFolders();
       await this.ledger.save();
-      new Notice(rep.failures.length ? `حُذف ${rep.deleted} مجلد، وفشل ${rep.failures.length}: ${this.redact(rep.failures[0].error)}` : `تم حذف ${rep.deleted} مجلد فارغ من Tdrive (إلى السلة)`, 8000);
+      new Notice(rep.failures.length ? this.t('notice.cleanFailed', { deleted: rep.deleted, failed: rep.failures.length, msg: this.redact(rep.failures[0].error) }) : this.t('notice.cleaned', { deleted: rep.deleted }), 8000);
     } catch (e) { new Notice('Tdrive: ' + this.redact(e.message), 8000); }
     this.notify();
   }
 
   async uploadCurrent() {
     const f = this.app.workspace.getActiveFile();
-    if (!f) { new Notice('لا يوجد ملف مفتوح'); return; }
+    if (!f) { new Notice(this.t('notice.noOpenFile')); return; }
     await this.runSync({ only: [f.path.normalize('NFC')] });
   }
 
@@ -508,8 +609,8 @@ class TdriveSyncPlugin extends Plugin {
     this.notify();
   }
 
-  async pause() { this.settings.paused = true; await this.saveSettings(); if (this.engine) this.engine.pause(); new Notice('تم إيقاف المزامنة'); this.notify(); }
-  async resume() { this.settings.paused = false; await this.saveSettings(); new Notice('تم استئناف المزامنة'); this.notify(); }
+  async pause() { this.settings.paused = true; await this.saveSettings(); if (this.engine) this.engine.pause(); new Notice(this.t('notice.pausedDone')); this.notify(); }
+  async resume() { this.settings.paused = false; await this.saveSettings(); new Notice(this.t('notice.resumedDone')); this.notify(); }
 
   setupAutoSync() {
     if (this._timer) { window.clearInterval(this._timer); this._timer = null; }
@@ -521,7 +622,7 @@ class TdriveSyncPlugin extends Plugin {
     let leaf = this.app.workspace.getLeavesOfType(VIEW_TYPE)[0];
     if (!leaf) {
       leaf = this.app.workspace.getRightLeaf(false);
-      if (!leaf) { new Notice('Tdrive: تعذّر فتح لوحة الحالة'); return; }
+      if (!leaf) { new Notice(this.t('notice.noView')); return; }
       await leaf.setViewState({ type: VIEW_TYPE, active: true });
     }
     this.app.workspace.revealLeaf(leaf);
@@ -536,8 +637,8 @@ class TdriveSyncPlugin extends Plugin {
       const raw = await c.request({ path: '/files', query: { path: root, limit: 100 } });
       this.ledger.addLog('info', 'GET /files keys: ' + shape(raw));
       for (const k of Object.keys(raw || {})) if (Array.isArray(raw[k]) && raw[k][0] != null) this.ledger.addLog('info', `  ${k}: ${raw[k].length} item(s); [0] keys: ` + shape(raw[k][0]));
-      await this.ledger.save(); new Notice('تم تسجيل شكل الاستجابات في السجل');
-    } catch (e) { new Notice('فشل الفحص: ' + this.redact(e.message), 8000); }
+      await this.ledger.save(); new Notice(this.t('notice.probed'));
+    } catch (e) { new Notice(this.t('notice.probeFailed', { msg: this.redact(e.message) }), 8000); }
     this.notify();
   }
 }

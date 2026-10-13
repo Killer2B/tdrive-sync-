@@ -20,6 +20,10 @@ function createMockServer(opts = {}) {
   const tick = () => (st.clock += 1000);
   const fileJson = (f) => ({ id: f.id, name: f.name, path: f.path, size: f.bytes.length, lastModified: f.lastModified, trashed: f.trashed });
   const live = () => [...st.files.values()].filter((f) => !f.trashed);
+  // Activity recorded by requests during a sync must look OLDER than the engine's snapshot stamp; activity
+  // simulating another device (the helpers below) must look NEWER. The fake clock is far in the past.
+  const note = (action, target, at) => { st.activity.push({ action, target, detail: '{}', created_at: new Date(at || st.clock).toISOString() }); };
+  const noteExternal = (action, target) => note(action, target, Date.now() + 1000);
 
   function addFolder(p) { p = normFolder(p); const parts = p.split('/').filter(Boolean); let cur = '/'; for (const s of parts) { cur += s + '/'; st.folders.add(cur); } }
   function createFile(name, path, bytes, lastModified) {
@@ -34,14 +38,17 @@ function createMockServer(opts = {}) {
     const f = { id: 'f' + st.nextId++, name, path, bytes: Buffer.from(bytes), lastModified: lastModified || tick(), trashed: false };
     st.files.set(f.id, f); return { f };
   }
-  st.addFile = (path, name, data) => { addFolder(path); return createFile(name, path, Buffer.from(data)).f; };
-  st.modifyFile = (id, data) => { const f = st.files.get(id); f.bytes = Buffer.from(data); f.lastModified = tick(); return f; };
-  st.removeFile = (id) => { st.files.get(id).trashed = true; };
+  st.addFile = (path, name, data) => { addFolder(path); const f = createFile(name, path, Buffer.from(data)).f; noteExternal('upload', f.id); return f; };
+  st.modifyFile = (id, data) => { const f = st.files.get(id); f.bytes = Buffer.from(data); f.lastModified = tick(); noteExternal('update', id); return f; };
+  st.removeFile = (id) => { st.files.get(id).trashed = true; noteExternal('trash', id); };
+  st.removeFile = (id) => { st.files.get(id).trashed = true; noteExternal('trash', id); };
   st.findLive = (path, name) => live().find((f) => f.path === normFolder(path) && f.name === name);
   st.liveFiles = live;
   st.failRule = (match, action, times = 1) => st.rules.push({ match, action, times });
-  st.removeFolder = (p) => { p = normFolder(p); for (const f of [...st.folders]) if (f.startsWith(p)) st.folders.delete(f); for (const f of st.files.values()) if (f.path.startsWith(p)) f.trashed = true; };
+  st.removeFolder = (p) => { p = normFolder(p); for (const f of [...st.folders]) if (f.startsWith(p)) st.folders.delete(f); for (const f of st.files.values()) if (f.path.startsWith(p)) f.trashed = true; noteExternal('move', p); };
   st.opsLog = () => st.log.filter((l) => l.method !== 'GET');
+  st.activity = [];
+  st.addActivity = (action, target, detail) => noteExternal(action, target);
 
   const send = (res, status, body, headers = {}) => {
     const buf = Buffer.isBuffer(body) ? body : Buffer.from(JSON.stringify(body));
@@ -73,6 +80,7 @@ function createMockServer(opts = {}) {
     try {
       if (route === '' && m === 'GET') return ok(res, { upload: { oneShotMaxBytes: st.oneShotMax, chunkBytes: st.chunk } });
       if (route === '/me') return ok(res, { name: 'tester' });
+      if (route === '/activity') return ok(res, { activity: st.activity, nextOffset: null });
       if (route === '/files' && m === 'GET') {
         const p = normFolder(u.searchParams.get('path'));
         if (!st.folders.has(p) && p !== '/') return fail(res, 404, 'not_found', 'no such folder');
@@ -102,6 +110,7 @@ function createMockServer(opts = {}) {
         const r = createFile(u.searchParams.get('name'), path, body);
         if (r.err) return fail(res, ...r.err);
         if (key) st.idem.set(key, r.f.id);
+        note('upload', r.f.id);
         return ok(res, fileJson(r.f), 201);
       }
       let mm;
@@ -116,10 +125,10 @@ function createMockServer(opts = {}) {
       if ((mm = /^\/files\/([^/]+)$/.exec(route))) {
         const f = st.files.get(mm[1]); if (!f) return fail(res, 404, 'not_found', 'nope');
         if (m === 'GET') return ok(res, fileJson(f));
-        if (m === 'DELETE') { if (u.searchParams.get('permanent') === '1') return fail(res, 400, 'refused', 'test'); f.trashed = true; return ok(res, { id: f.id }); }
-        if (m === 'PATCH') { const j = JSON.parse(body.toString()); if (j.name) f.name = j.name; return ok(res, fileJson(f)); }
+        if (m === 'DELETE') { if (u.searchParams.get('permanent') === '1') return fail(res, 400, 'refused', 'test'); f.trashed = true; note('trash', f.id); return ok(res, { id: f.id }); }
+        if (m === 'PATCH') { const j = JSON.parse(body.toString()); if (j.path) f.path = normFolder(j.path); if (j.name) f.name = j.name; note('rename', f.id); return ok(res, fileJson(f)); }
       }
-      if ((mm = /^\/trash\/([^/]+)\/restore$/.exec(route)) && m === 'POST') { const f = st.files.get(mm[1]); if (f) f.trashed = false; return ok(res, { id: mm[1] }); }
+      if ((mm = /^\/trash\/([^/]+)\/restore$/.exec(route)) && m === 'POST') { const f = st.files.get(mm[1]); if (f) f.trashed = false; note('restore', mm[1]); return ok(res, { id: mm[1] }); }
       if (m === 'DELETE' && (route === '/folders' || /^\/folders\/[^/]+$/.test(route))) {
         if (st.folderDelete === 'none') return fail(res, 405, 'method_not_allowed', 'no');
         let p;
@@ -130,6 +139,7 @@ function createMockServer(opts = {}) {
         if (u.searchParams.get('permanent') === '1') return fail(res, 400, 'refused', 'test');
         for (const f of [...st.folders]) if (f.startsWith(p)) st.folders.delete(f);       // sub-folders go too
         for (const f of st.files.values()) if (f.path.startsWith(p)) f.trashed = true;    // soft delete of contents
+        note('move', p);
         return send(res, 204, Buffer.alloc(0));      // empty body on purpose: real servers often do this
       }
       if (route === '/folders' && m === 'POST') {
@@ -159,7 +169,7 @@ function createMockServer(opts = {}) {
         const all = Buffer.concat([...Array(n).keys()].map((i) => s.parts.get(i)));
         const r = createFile(s.name, s.path, all, s.lastModified);
         if (r.err) return fail(res, ...r.err);
-        s.done = r.f.id; return ok(res, fileJson(r.f));
+        s.done = r.f.id; note('upload', r.f.id); return ok(res, fileJson(r.f));
       }
       if ((mm = /^\/uploads\/([^/]+)$/.exec(route)) && m === 'GET') {
         const s = st.uploads.get(mm[1]); if (!s) return fail(res, 404, 'not_found', 'no session');

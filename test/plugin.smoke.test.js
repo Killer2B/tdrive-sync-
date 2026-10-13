@@ -37,7 +37,7 @@ test('built main.js loads, registers commands, tests connection, syncs both ways
     Plugin: class { constructor(app, manifest) { this.app = app; this.manifest = manifest; this.commands = []; this.data = null; }
       async loadData() { return this.data; } async saveData(d) { this.data = d; }
       addCommand(c) { this.commands.push(c); } addSettingTab(t) { this.tab = t; } registerView() {} addRibbonIcon() {}
-      addStatusBarItem() { return { setText() {} }; } registerInterval() {} },
+      addStatusBarItem() { return { setText() {} }; } registerInterval() {} registerEvent() {} },
     PluginSettingTab: class { constructor(app, plugin) { this.app = app; this.plugin = plugin; this.containerEl = proxy(); } },
     Setting: class { constructor() { return proxy(); } },
     Notice: class { constructor(m) { notices.push(m); } },
@@ -56,29 +56,29 @@ test('built main.js loads, registers commands, tests connection, syncs both ways
 
   const fa = makeApp();
   const plugin = new Plugin(fa.app, { dir: '.obsidian/plugins/tdrive-sync' });
-  plugin.data = { baseUrl: server.url, apiKey: server.key, remoteFolder: '/Vault/' };
-  await plugin.onload();
+  plugin.data = { baseUrl: server.url, apiKey: server.key, remoteFolder: '/Vault/', remoteLock: false };
+  try {
+    await plugin.onload();
 
-  const names = plugin.commands.map((c) => c.name);
-  for (const n of ['Test Connection', 'Sync Now', 'Upload Current File', 'Download Remote Changes', 'View Conflicts', 'View Sync Log', 'Pause Sync', 'Resume Sync']) assert.ok(names.includes('Tdrive Sync: ' + n), n);
-  plugin.tab.display();                                   // settings UI builds without throwing
+    const names = plugin.commands.map((c) => c.name);
+    for (const n of ['Test Connection', 'Sync Now', 'Upload Current File', 'Download Remote Changes', 'View Conflicts', 'View Sync Log', 'Pause Sync', 'Resume Sync']) assert.ok(names.includes('Tdrive Sync: ' + n), n);
+    plugin.tab.display();                                   // settings UI builds without throwing
 
-  await plugin.testConnection();
-  assert.match(plugin.connection, /^متصل/);
+    await plugin.testConnection();
+    assert.match(plugin.connection, /^(متصل|✓)/);
 
-  fa.put('ملاحظاتي/مشروع جديد/الدرس الأول.md', 'نص عربي'); fa.put('a.md', 'A');
-  const rep = await plugin.runSync();
-  assert.equal(rep.status, 'ok'); assert.equal(rep.uploaded, 2);
-  assert.equal(server.findLive('/Vault/ملاحظاتي/مشروع جديد/', 'الدرس الأول.md').bytes.toString(), 'نص عربي');
-  assert.ok(await fa.app.vault.adapter.exists('.obsidian/plugins/tdrive-sync/sync-state.json'));  // ledger persisted
+    fa.put('ملاحظاتي/مشروع جديد/الدرس الأول.md', 'نص عربي'); fa.put('a.md', 'A');
+    const rep = await plugin.runSync();
+    assert.equal(rep.status, 'ok'); assert.equal(rep.uploaded, 2);
+    assert.equal(server.findLive('/Vault/ملاحظاتي/مشروع جديد/', 'الدرس الأول.md').bytes.toString(), 'نص عربي');
+    assert.ok(await fa.app.vault.adapter.exists('.obsidian/plugins/tdrive-sync/sync-state.json'));  // ledger persisted
 
-  server.addFile('/Vault/', 'remote.md', 'R');
-  const rep2 = await plugin.runSync({ mode: 'download-only' });
-  assert.equal(rep2.downloaded, 1); assert.equal(fa.files.get('remote.md').tfile.data.toString(), 'R');
+    server.addFile('/Vault/', 'remote.md', 'R');
+    const rep2 = await plugin.runSync({ mode: 'download-only' });
+    assert.equal(rep2.downloaded, 1); assert.equal(fa.files.get('remote.md').tfile.data.toString(), 'R');
 
-  await plugin.pause(); assert.equal(await plugin.runSync(), null);   // paused -> nothing runs
-  await plugin.resume();
-  const view = new (class extends stub.ItemView {})(null); // render path uses proxies only; ensure no throw in logic below
-  plugin.probeApi && await plugin.probeApi();
-  await server.stop();
+    await plugin.pause(); assert.equal(await plugin.runSync(), null);   // paused -> nothing runs
+    await plugin.resume();
+    plugin.probeApi && await plugin.probeApi();
+  } finally { await server.stop(); }
 });

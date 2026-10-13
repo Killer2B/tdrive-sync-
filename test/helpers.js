@@ -20,6 +20,23 @@ class MemFS {
   async listFolders() { return [...this.dirs]; }
   async readBinary(p) { const f = this.files.get(p); if (!f) throw new Error('ENOENT ' + p); return f.data.buffer.slice(f.data.byteOffset, f.data.byteOffset + f.data.length); }
   async writeBinary(p, buf) { this.put(p, buf); }
+  async appendBinary(p, buf) {
+    const prev = this.files.get(p);
+    const add = Buffer.from(buf);
+    const merged = prev ? Buffer.concat([prev.data, add]) : add;
+    this.files.set(p, { data: merged, mtime: ++this.clock });
+  }
+  get canStream() { return true; }
+  async beginStreamWrite(p) {
+    let n = 0;
+    return {
+      write: async (chunk) => {
+        const b = chunk instanceof ArrayBuffer ? Buffer.from(chunk) : Buffer.from(chunk.buffer ? chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength) : chunk);
+        if (n++ === 0) this.put(p, b); else await this.appendBinary(p, b);
+      },
+      close: async () => p,
+    };
+  }
   async stat(p) { const f = this.files.get(p); return f ? { size: f.data.length, mtime: f.mtime } : null; }
   async exists(p) { return this.files.has(p) || this.dirs.has(p); }
   async trash(p) { this.trashed.push({ path: p, data: this.files.get(p).data }); this.files.delete(p); }   // empty parent folders stay
@@ -32,7 +49,7 @@ async function makeEnv(o = {}) {
   const sleeps = [];
   const settings = {
     baseUrl: server.url, remoteFolder: '/Vault/', mode: 'two-way', deletionPolicy: 'trash', maxDeletesPerRun: 10,
-    excludePatterns: [], downloadChunkBytes: 64 * 1024, ...(o.settings || {}),
+    excludePatterns: [], downloadChunkBytes: 64 * 1024, remoteLock: false, ...(o.settings || {}),
   };
   const mkClient = (key, extra) => new TdriveClient({ baseUrl: server.url, apiKey: key || server.key, transport: nodeTransport, allowInsecure: true, sleep: async (ms) => { sleeps.push(ms); }, maxRetries: 4, ...(o.client || {}), ...(extra || {}) });
   const mkDevice = (device = {}) => {

@@ -1,5 +1,6 @@
 'use strict';
 const { suffixName, sha256Hex } = require('./util');
+const { merge3 } = require('./MergeManager');
 
 /**
  * A conflict = changed locally AND remotely since the last successful sync (or both exist with
@@ -37,7 +38,30 @@ class ConflictManager {
     let remote = null;
     try { remote = await engine.client.getFile(c.remoteId); } catch (e) { if (e.status !== 404) throw e; }
 
-    if (choice === 'remote') {
+    if (choice === 'merge') {
+      // Auto-merge needs the last synced base text (stored for small text files) plus both new versions.
+      const E = this.manifest.getFile(rel);
+      if (!remote) throw new Error('Remote version no longer exists; keep local or both instead.');
+      if (!E || typeof E.baseText !== 'string') throw new Error('Auto-merge unavailable: no base version (the file was first synced before 1.1.0 or is binary/large).');
+      const localData = await this.local.readBinary(rel);
+      const remoteData = await engine.downloadFn(engine.client, remote, engine._downOpts());
+      const dec = new TextDecoder();
+      let m;
+      try { m = merge3(E.baseText, dec.decode(localData), dec.decode(remoteData)); }
+      catch (e) { throw new Error('Auto-merge failed: ' + e.message); }
+      if (m.ok) {
+        await this.local.writeBinary(rel, new TextEncoder().encode(m.text).buffer);
+        await engine.pushLocal(rel, remote);
+        if (await this.local.exists(c.copyPath)) await this.local.trash(c.copyPath);
+        this.manifest.addLog('info', `Conflict auto-merged (no overlapping edits): ${rel}`);
+      } else {
+        const draft = await this._uniqueName(rel, 'Tdrive merged');
+        await this.local.writeBinary(draft, new TextEncoder().encode(m.text).buffer);
+        this.manifest.addLog('warn', `Conflict on ${rel} has ${m.conflicts} overlapping region(s); a merged draft with markers was written to ${draft}. The conflict stays open.`);
+        await this.manifest.save();
+        return { resolved: false, merged: false, conflicts: m.conflicts, draft };
+      }
+    } else if (choice === 'remote') {
       if (!remote) throw new Error('Remote version no longer exists; keep local or both instead.');
       // Preserve the local version first, then write the remote one.
       const backup = await this._uniqueName(rel, 'Tdrive local backup');

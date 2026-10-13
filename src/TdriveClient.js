@@ -87,6 +87,11 @@ class TdriveClient {
         continue;
       }
       if (res.status === 429 || res.status >= 500) {
+        if (res.status === 429) {
+          // Back off the parallelism, not just this request: the server is rate limiting us.
+          const cur = Number.isFinite(this._concurrencyHint) ? this._concurrencyHint : 3;
+          this._concurrencyHint = Math.max(1, cur - 1);
+        }
         const err = this._httpError(res);
         if (attempt >= this.maxRetries) throw err;
         await this._wait(attempt, err.retryAfter);
@@ -261,11 +266,23 @@ class TdriveClient {
     throw new TdriveError('Folder delete failed (' + tried.join(', ') + '): ' + (last && last.message), { status: last && last.status, code: last && last.code });
   }
 
-  async rename(id, name) {
+  async _patch(id, body) {
     return normalizeFileResponse(await this.request({
       method: 'PATCH', path: '/files/' + encodeURIComponent(id),
-      headers: { 'Content-Type': 'application/json' }, body: new TextEncoder().encode(JSON.stringify({ name })).buffer,
+      headers: { 'Content-Type': 'application/json' }, body: new TextEncoder().encode(JSON.stringify(body)).buffer,
     }));
+  }
+
+  async rename(id, name) { return this._patch(id, { name }); }
+
+  /** Renames and/or moves a file in place (no re-upload). The real server handles `name` and `path` reliably only
+   *  as SEPARATE PATCH calls (a combined body can silently ignore one of them), so they are issued one by one. */
+  async move(id, { name, path } = {}) {
+    let f = null;
+    if (path) f = await this._patch(id, { path });
+    if (name) f = await this._patch(id, { name });
+    if (!f) f = await this.getFile(id);
+    return f;
   }
 
   /** Creates folder `name` under parent `path` ("/a/b/"). The body shape is undocumented and a wrong one answers 400,

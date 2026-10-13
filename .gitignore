@@ -1,0 +1,5 @@
+node_modules/
+*.zip
+tdrive-sync-log.txt
+.DS_Store
+Thumbs.db

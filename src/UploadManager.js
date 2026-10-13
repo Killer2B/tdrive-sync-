@@ -45,7 +45,7 @@ async function uploadResumable(client, { name, folderPath, data, mtime, onProgre
     const id = (sess && (sess.id || sess.uploadId || (sess.upload && sess.upload.id)));
     if (!id) throw new Error('Upload session response did not include an id');
     const srv = Number(sess && sess.chunkSize);
-    return { id, chunk, n, hashes, srvChunk: Number.isFinite(srv) && srv > 0 ? srv : null };
+    return { id, chunk, n, hashes, fingerprint, srvChunk: Number.isFinite(srv) && srv > 0 ? srv : null };
   };
 
   let s = await openSession(provisionalChunk);
@@ -71,7 +71,7 @@ async function uploadResumable(client, { name, folderPath, data, mtime, onProgre
   }
   if (onProgress) onProgress(Math.min(done, total), total);
 
-  const conc = clamp(concurrency || 1, 1, MAX_CONCURRENCY);
+  const conc = clamp(Math.min(concurrency || 1, Number.isFinite(client._concurrencyHint) ? client._concurrencyHint : Infinity), 1, MAX_CONCURRENCY);
   await pool(missing, conc, async (i) => {
     const start = i * chunk;
     const len = Math.min(chunk, total - start);
@@ -85,6 +85,9 @@ async function uploadResumable(client, { name, folderPath, data, mtime, onProgre
   });
 
   const fin = await client.request({ method: 'POST', path: `/uploads/${enc(id)}/complete` });
+  // The server returns its own checksum (sha256 of the part-hash list) which must equal our fingerprint.
+  const srvCk = fin && (fin.checksum || (fin.file && fin.file.checksum));
+  if (srvCk && srvCk !== s.fingerprint) throw new Error('Upload checksum mismatch reported by the server — the file was not stored correctly');
   let f = normalizeFileResponse(fin);
   if (!f || !f.id) throw new Error('Completed upload did not return a file');
   if (f.size == null) f = await client.getFile(f.id);

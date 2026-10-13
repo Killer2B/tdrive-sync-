@@ -88,10 +88,36 @@ async function downloadParallel(client, file, chunkBytes, concurrency, onProgres
   return out;
 }
 
+/** Sequential ranged download written straight to `sink` (disk), so a huge file never sits in memory.
+ *  Used only for plaintext downloads of a known size; the caller handles hashing/recording. */
+async function downloadToSink(client, file, chunkBytes, onProgress, sink) {
+  const known = file.size;
+  let offset = 0;
+  while (offset < known) {
+    const res = await rangeRequest(client, file.id, offset, offset + chunkBytes - 1);
+    if (res.status === 206) {
+      const m = /bytes\s+(\d+)-(\d+)\//i.exec(res.headers['content-range'] || '');
+      if (m && Number(m[1]) !== offset) throw new Error('Unexpected Content-Range start');
+      if (res.body.byteLength === 0) break;
+      await sink.write(res.body); offset += res.body.byteLength;
+    } else {
+      const whole = offset === 0 ? res.body : res.body.slice(offset);
+      await sink.write(whole); offset += whole.byteLength;
+    }
+    if (onProgress) onProgress(offset, known);
+  }
+  if (offset !== known) throw new Error(`Incomplete download: ${offset}/${known} bytes`);
+  if (onProgress) onProgress(known, known);
+  return { streamed: true, size: offset };
+}
+
 async function downloadFile(client, file, opts = {}) {
   const chunkBytes = opts.chunkBytes || 4 * 1024 * 1024;
-  const concurrency = clamp(opts.concurrency || 1, 1, MAX_CONCURRENCY);
+  const hint = Number.isFinite(client._concurrencyHint) ? client._concurrencyHint : Infinity;
+  const concurrency = clamp(Math.min(opts.concurrency || 1, hint), 1, MAX_CONCURRENCY);
   const known = Number.isFinite(file.size) ? file.size : null;
+  // Streaming to disk is only safe for a plaintext download of a known size.
+  if (opts.sink && known !== null && known > 0 && !opts.crypto) return downloadToSink(client, file, chunkBytes, opts.onProgress, opts.sink);
   let buf;
   if (known === 0) buf = new ArrayBuffer(0);
   else if (known !== null && known > chunkBytes && concurrency > 1) buf = await downloadParallel(client, file, chunkBytes, concurrency, opts.onProgress);
@@ -100,4 +126,4 @@ async function downloadFile(client, file, opts = {}) {
   return buf;
 }
 
-module.exports = { downloadFile, downloadSequential, downloadParallel, readRange };
+module.exports = { downloadFile, downloadSequential, downloadParallel, readRange, downloadToSink };

@@ -9,7 +9,7 @@ class ManifestStore {
     this.now = now;
     this.data = ManifestStore.empty();
   }
-  static empty() { return { version: 1, files: {}, folders: {}, conflicts: {}, log: [], meta: { lastRun: null, lastSuccessAt: null } }; }
+  static empty() { return { version: 1, files: {}, folders: {}, conflicts: {}, log: [], meta: { lastRun: null, lastSuccessAt: null, deletions: [] } }; }
 
   async load() {
     let raw = null;
