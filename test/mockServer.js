@@ -89,6 +89,7 @@ function createMockServer(opts = {}) {
     const chunks = []; for await (const c of req) chunks.push(c);
     const body = Buffer.concat(chunks);
     const u = new URL(req.url, 'http://x');
+    let mm;
     const route = u.pathname.replace(/^\/api\/v1/, '') || '';
     const partM = /^\/uploads\/([^/]+)\/parts\/(\d+)$/.exec(route);
     const info = { method: req.method, route, query: Object.fromEntries(u.searchParams), range: req.headers.range, partIdx: partM ? Number(partM[2]) : undefined, name: u.searchParams.get('name') };
@@ -108,6 +109,34 @@ function createMockServer(opts = {}) {
       if (route === '' && m === 'GET') return ok(res, { upload: { oneShotMaxBytes: st.oneShotMax, chunkBytes: st.chunk } });
       if (route === '/me') return ok(res, { name: 'tester' });
       if (route === '/activity') return ok(res, { activity: st.activity, nextOffset: null });
+      if (route === '/search' && m === 'GET') {
+        const q = (u.searchParams.get('q') || '').toLowerCase();
+        const files = live().filter((f) => String(f.name).toLowerCase().includes(q)).map((f) => fileJson(f));
+        return ok(res, { files, limit: 200, offset: 0, nextOffset: null });
+      }
+      if (route === '/chunks/lookup' && m === 'POST') {
+        const j = JSON.parse(body.toString());
+        const available = (j.checksums || []).filter((h) => st.chunkStore.has(h));
+        return ok(res, { available, chunkBytes: effChunk() });
+      }
+      if ((mm = /^\/files\/([^/]+)\/shares$/.exec(route)) && m === 'POST') {
+        const f = st.files.get(mm[1]); if (!f) return fail(res, 404, 'not_found', 'nope');
+        const token = 'sh' + st.nextId++; return ok(res, { token, url: st.url + '/s/' + token, permission: 'download' }, 201);
+      }
+      if ((mm = /^\/files\/([^/]+)\/versions$/.exec(route)) && m === 'GET') {
+        const f = st.files.get(mm[1]); if (!f) return fail(res, 404, 'not_found', 'nope');
+        const versions = (f.versions || []).map((v, i) => ({ id: 'v' + (i + 1), version: v.version || (i + 1), size: v.bytes.length, created_at: new Date(st.clock).toISOString() })).reverse();
+        return ok(res, { versions });
+      }
+      if ((mm = /^\/files\/([^/]+)\/versions\/([^/]+)\/restore$/.exec(route)) && m === 'POST') {
+        const f = st.files.get(mm[1]); if (!f) return fail(res, 404, 'not_found', 'nope');
+        const idx = Number(String(mm[2]).replace(/\D/g, '')) - 1;
+        const v = (f.versions || [])[idx];
+        if (!v) return fail(res, 404, 'not_found', 'no version');
+        f.versions = f.versions || []; f.versions.push({ version: (f.version || 1) + 1, bytes: f.bytes });
+        f.bytes = Buffer.from(v.bytes); f.version = (f.version || 1) + 1; f.chunks = null; note('restore', f.id);
+        return ok(res, {});
+      }
       if (route === '/files' && m === 'GET') {
         const p = normFolder(u.searchParams.get('path'));
         if (!st.folders.has(p) && p !== '/') return fail(res, 404, 'not_found', 'no such folder');
@@ -140,7 +169,7 @@ function createMockServer(opts = {}) {
         note('upload', r.f.id);
         return ok(res, fileJson(r.f), 201);
       }
-      let mm;
+
       if ((mm = /^\/files\/([^/]+)\/chunks$/.exec(route)) && m === 'GET') {
         const f = st.files.get(mm[1]); if (!f) return fail(res, 404, 'not_found', 'nope');
         const etag = etagOf(f);
@@ -219,10 +248,10 @@ function createMockServer(opts = {}) {
         const s = st.uploads.get(mm[1]); if (!s) return fail(res, 404, 'not_found', 'no session');
         const idx = Number(mm[2]);
         if (req.headers['x-chunk-reuse'] === '1') {
-          // Claim an already-stored chunk with no body — only honoured when the base really stores that hash.
+          // Claim an already-stored chunk with no body. Reuse is scoped to the account (its own chunks),
+          // so it works both for revisions and for brand-new files (dedup).
           const want = req.headers['x-content-sha256'];
-          const inBase = s.base && s.base.parts.some((p) => p.checksum === want);
-          if (!inBase || !st.chunkStore.has(want)) return fail(res, 409, 'ChunkNotAvailable', 'not stored server-side');
+          if (!st.chunkStore.has(want)) return fail(res, 409, 'ChunkNotAvailable', 'not stored server-side');
           s.reuse.add(idx); s.parts.set(idx, st.chunkStore.get(want));
           return ok(res, { idx, reused: true });
         }

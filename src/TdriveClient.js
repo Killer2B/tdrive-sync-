@@ -169,6 +169,11 @@ class TdriveClient {
 
   async getFile(id) { return normalizeFileResponse(await this.request({ path: '/files/' + encodeURIComponent(id) })); }
 
+  /** Which of these chunk SHA-256 hashes does the server already store for this account? (≤500 per call) */
+  async chunksLookup(checksums) {
+    return this.request({ method: 'POST', path: '/chunks/lookup', headers: { 'Content-Type': 'application/json' }, body: new TextEncoder().encode(JSON.stringify({ checksums })).buffer });
+  }
+
   /** Soft delete (goes to Tdrive trash, recoverable). Permanent deletion is never used. */
   trash(id) { return this.request({ method: 'DELETE', path: '/files/' + encodeURIComponent(id), query: { permanent: 0 } }); }
   restore(id) { return this.request({ method: 'POST', path: '/trash/' + encodeURIComponent(id) + '/restore' }); }

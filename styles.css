@@ -21,3 +21,7 @@
   padding: 8px 10px;
   font-size: 0.9em;
 }
+.tdrive-conflict-preview { display: flex; gap: 10px; margin: 8px 0; }
+.tdrive-conflict-preview .tdrive-conflict-col { flex: 1 1 0; min-width: 0; }
+.tdrive-conflict-preview h5 { margin: 0 0 4px; font-size: 0.85em; opacity: 0.8; }
+.tdrive-conflict-preview pre { max-height: 40vh; overflow: auto; margin: 0; }

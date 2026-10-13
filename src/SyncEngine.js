@@ -59,8 +59,8 @@ class SyncEngine {
     this._dirCache = new Map();
   }
 
-  /** Transfer options (chunk size, parallel parts, encryption, compression) taken from the live settings. */
-  _upOpts() { const s = this.getSettings(); return { chunkBytes: s.uploadChunkBytes, concurrency: s.maxConcurrentParts, crypto: this.crypto, compressor: this.compressor }; }
+  /** Transfer options (chunk size, parallel parts, encryption, compression, dedup) from the live settings. */
+  _upOpts() { const s = this.getSettings(); return { chunkBytes: s.uploadChunkBytes, concurrency: s.maxConcurrentParts, crypto: this.crypto, compressor: this.compressor, dedupe: s.dedupeUploads !== false }; }
   _downOpts() { const s = this.getSettings(); return { chunkBytes: s.downloadChunkBytes, concurrency: s.maxConcurrentParts, crypto: this.crypto, compressor: this.compressor }; }
 
   /** Emits byte-level progress for the file currently being transferred. */
@@ -377,12 +377,9 @@ class SyncEngine {
     if (!oldRemote) oldRemote = (await this._dirIndex(folderPath)).files.get(nfc(name));
     // Reuse the chunker we already know for this file so a later edit keeps the same boundaries (best reuse).
     const prev = this.manifest.getFile(rel);
-    const cdc = this.getSettings().cdcFiles !== false;    // false = plain fixed chunks (a revisable base)
+    const cdc = this.getSettings().cdcFiles !== false;    // false = plain fixed chunks (revisable base)
     const chunker = cdc ? ((prev && prev.chunkMap && prev.chunkMap.chunker) || undefined) : false;
-    // The deployed server cannot revise a CDC-chunked file in place (it commits a duplicate instead), so an
-    // in-place revision is only attempted for files that were NOT uploaded with content-defined chunking.
-    const baseIsCdc = !!(prev && prev.chunkMap && prev.chunkMap.chunker);
-    const res = await this._replaceUpload({ name, folderPath, data, mtime: lstat.mtime, old: oldRemote, onProgress, chunker, allowRevision: !baseIsCdc });
+    const res = await this._replaceUpload({ name, folderPath, data, mtime: lstat.mtime, old: oldRemote, onProgress, chunker });
     (await this._dirIndex(folderPath)).files.set(nfc(name), res);
     this._record(rel, { lhash, lstat, remote: res, text: this._baseTextFor(data) });
     // Record the resulting chunk map (the server's own, if it re-chunked) so the next change is incremental.

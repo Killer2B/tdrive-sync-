@@ -29,7 +29,14 @@ const DEFAULTS = {
   wifiOnly: false,                     // do not use the network on a cellular connection
   cellularMaxFileMB: 5,                // on cellular, defer files larger than this (0 = never defer)
   syncOnChange: false,                 // auto-sync shortly after a local edit
-  syncOnChangeDelaySeconds: 5,         // debounce window for change-triggered syncs
+  syncOnChangeDelaySeconds: 2,         // debounce window for change-triggered syncs (1 = near-instant)
+  instantSync: false,                  // react to edits immediately (1s debounce) and on window focus
+  maxUploadKBps: 0,                    // upload speed cap in KB/s (0 = unlimited)
+  maxDownloadKBps: 0,                  // download speed cap in KB/s (0 = unlimited)
+  scheduleEnabled: false,              // only auto-sync inside the window below
+  scheduleStart: 0,                    // hour 0-23
+  scheduleEnd: 0,                      // hour 0-23 (end <= start means it wraps midnight)
+  dedupeUploads: true,                 // reuse chunks the server already stores (saves upload data)
   mergeTextFiles: true,                // keep a small text base so conflicts can be auto-merged
   streamLargeDownloads: true,          // write very large plaintext downloads straight to disk (bounded memory)
   streamThresholdMB: 8,                // ...for files at least this large
@@ -70,6 +77,33 @@ async function obsidianTransport({ url, method, headers, body }) {
   const out = {};
   for (const [k, v] of Object.entries(r.headers || {})) out[k.toLowerCase()] = v;
   return { status: r.status, headers: out, body: r.arrayBuffer };
+}
+
+/** A simple token-bucket rate limiter (bytes observed -> delayed start) so the user can cap bandwidth.
+ *  Shared, per direction, so parallel parts still respect the overall limit. 0 KB/s = unlimited. */
+function makeRateLimiter(getKBps) {
+  let next = 0;
+  return async (bytes) => {
+    const kbps = getKBps();
+    if (!kbps || kbps <= 0 || !bytes) return;
+    const now = Date.now();
+    const start = Math.max(now, next);
+    next = start + (bytes / 1024) / kbps * 1000;
+    const wait = start - now;
+    if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+  };
+}
+
+/** Wraps the transport with the upload/download limits taken from the live settings. */
+function makeThrottledTransport(getLimits) {
+  const up = makeRateLimiter(() => getLimits().maxUploadKBps);
+  const down = makeRateLimiter(() => getLimits().maxDownloadKBps);
+  return async (req) => {
+    if (req && req.body && req.body.byteLength) await up(req.body.byteLength);
+    const res = await obsidianTransport(req);
+    if (res && res.body && res.body.byteLength) await down(res.body.byteLength);
+    return res;
+  };
 }
 
 class ObsidianLocalFS {
@@ -195,6 +229,26 @@ class ConflictModal extends Modal {
     contentEl.createEl('h3', { text: t('conflict.title', { path: this.path }) });
     const c = this.plugin.ledger.getConflict(this.path);
     contentEl.createEl('p', { text: t('conflict.body', { copy: c ? c.copyPath : '?' }) });
+    // Simple, read-only side-by-side preview (no line-by-line merge editor): the local file next to the
+    // conflict copy of the remote version, so the user can decide. Text files only, first 40 lines each.
+    try {
+      const local = this.plugin.app.vault.getAbstractFileByPath(this.path);
+      const copyFile = c && c.copyPath ? this.plugin.app.vault.getAbstractFileByPath(c.copyPath) : null;
+      const isText = (f) => f && /\.(md|markdown|txt|text|json|csv|yml|yaml|js|ts|css|html|xml)$/i.test(f.path);
+      if (local && copyFile && isText(local) && isText(copyFile)) {
+        const read = async (f) => { try { return await this.plugin.app.vault.read(f); } catch (e) { return null; } };
+        Promise.all([read(local), read(copyFile)]).then(([a, b]) => {
+          if (a == null || b == null) return;
+          const preview = contentEl.createDiv({ cls: 'tdrive-conflict-preview' });
+          const left = preview.createDiv({ cls: 'tdrive-conflict-col' });
+          left.createEl('h5', { text: t('conflict.localCol') });
+          left.createEl('pre', { cls: 'tdrive-sync-log' }).setText(a.split('\n').slice(0, 40).join('\n'));
+          const right = preview.createDiv({ cls: 'tdrive-conflict-col' });
+          right.createEl('h5', { text: t('conflict.remoteCol') });
+          right.createEl('pre', { cls: 'tdrive-sync-log' }).setText(b.split('\n').slice(0, 40).join('\n'));
+        }).catch(() => { /* preview is optional */ });
+      }
+    } catch (e) { /* preview is best effort */ }
     const opts = [
       ['merge', 'conflict.merge', 'conflict.mergeDesc'],
       ['local', 'conflict.local', 'conflict.localDesc'],
@@ -286,6 +340,82 @@ class NotifyPreviewModal extends Modal {
   onClose() { this.contentEl.empty(); }
 }
 
+class VersionsModal extends Modal {
+  constructor(app, plugin, path, remoteId) { super(app); this.plugin = plugin; this.path = path; this.remoteId = remoteId; }
+  async onOpen() {
+    const { contentEl } = this; const p = this.plugin; const t = p.t;
+    contentEl.empty(); contentEl.addClass('tdrive-sync-view');
+    contentEl.createEl('h3', { text: t('versions.title', { path: this.path }) });
+    const status = contentEl.createEl('p', { text: t('common.loading') });
+    try {
+      const client = p.makeClient();
+      const r = await client.request({ path: `/files/${encodeURIComponent(this.remoteId)}/versions` });
+      const list = (r && (r.versions || r.items)) || (Array.isArray(r) ? r : []);
+      if (!list.length) { status.setText(t('versions.none')); return; }
+      status.setText(t('versions.hint'));
+      for (const v of list) {
+        const row = contentEl.createDiv({ cls: 'tdrive-sync-row' });
+        const vid = v.id || v.versionId || v.version;
+        row.createSpan({ text: `${new Date(v.created_at || v.createdAt || 0).toLocaleString()} · ${v.size != null ? v.size + ' B' : ''}` });
+        row.createEl('button', { text: t('versions.restore') }).onclick = async () => {
+          try { await client.request({ method: 'POST', path: `/files/${encodeURIComponent(this.remoteId)}/versions/${encodeURIComponent(String(vid))}/restore` }); new Notice(t('versions.restored')); this.close(); p.runSync({ silent: true }); }
+          catch (e) { new Notice(t('versions.failed', { msg: p.redact(e.message) }), 8000); }
+        };
+      }
+    } catch (e) { status.setText(t('versions.failed', { msg: p.redact(e.message) })); }
+  }
+  onClose() { this.contentEl.empty(); }
+}
+
+class FolderPickerModal extends Modal {
+  constructor(app, plugin) { super(app); this.plugin = plugin; }
+  onOpen() {
+    const { contentEl } = this; const p = this.plugin; const t = p.t;
+    contentEl.empty(); contentEl.addClass('tdrive-sync-view');
+    contentEl.createEl('h3', { text: t('selective.title') });
+    contentEl.createEl('p', { text: t('selective.hint') });
+    const folders = (typeof p.app.vault.getAllLoadedFiles === 'function')
+      ? p.app.vault.getAllLoadedFiles().filter((f) => f && Array.isArray(f.children) && f.path && f.path !== '/')
+      : [];
+    const chosen = new Set(p.settings.syncFolders || []);
+    const all = contentEl.createDiv({ cls: 'tdrive-sync-row' });
+    all.createEl('button', { text: t('selective.all') }).onclick = async () => { p.settings.syncFolders = []; await p.saveSettings(); this.close(); new Notice(t('selective.saved')); };
+    if (!folders.length) contentEl.createEl('p', { text: t('selective.empty') });
+    for (const f of folders.slice(0, 400)) {
+      new Setting(contentEl).setName(f.path).addToggle((tg) => tg.setValue(chosen.has(f.path)).onChange((v) => { if (v) chosen.add(f.path); else chosen.delete(f.path); }));
+    }
+    const bar = contentEl.createDiv({ cls: 'tdrive-sync-row' });
+    bar.createEl('button', { text: t('common.save'), cls: 'mod-cta' }).onclick = async () => { p.settings.syncFolders = [...chosen]; await p.saveSettings(); this.close(); new Notice(t('selective.saved')); };
+    bar.createEl('button', { text: t('common.cancel') }).onclick = () => this.close();
+  }
+  onClose() { this.contentEl.empty(); }
+}
+
+class SearchModal extends Modal {
+  constructor(app, plugin) { super(app); this.plugin = plugin; }
+  onOpen() {
+    const { contentEl } = this; const p = this.plugin; const t = p.t;
+    contentEl.empty(); contentEl.addClass('tdrive-sync-view');
+    contentEl.createEl('h3', { text: t('search.title') });
+    const box = contentEl.createDiv({ cls: 'tdrive-sync-row' });
+    const input = box.createEl('input', { type: 'text', placeholder: t('search.placeholder') });
+    const results = contentEl.createDiv();
+    const run = async () => {
+      results.empty();
+      const q = input.value.trim(); if (!q) return;
+      try {
+        const r = await p.makeClient().request({ path: '/search', query: { q, limit: 50 } });
+        const files = (r && (r.files || r.results)) || [];
+        if (!files.length) { results.createEl('p', { text: t('search.none') }); return; }
+        for (const f of files) results.createEl('div').setText(`${f.path || '/'}${f.name} · ${f.size || 0} B`);
+      } catch (e) { results.createEl('p', { text: t('search.failed', { msg: p.redact(e.message) }) }); }
+    };
+    input.onkeydown = (e) => { if (e.key === 'Enter') run(); };
+    box.createEl('button', { text: t('search.go') }).onclick = run;
+  }
+  onClose() { this.contentEl.empty(); }
+}
+
 class SyncStatusView extends ItemView {
   constructor(leaf, plugin) { super(leaf); this.plugin = plugin; this._h = () => this.render(); }
   getViewType() { return VIEW_TYPE; }
@@ -359,7 +489,8 @@ class TdriveSettingTab extends PluginSettingTab {
     new Setting(containerEl).setName(t('settings.exclude')).setDesc(t('settings.excludeDesc'))
       .addTextArea((el) => el.setValue(s.excludePatterns.join('\n')).onChange(async (v) => { s.excludePatterns = v.split('\n').map((x) => x.trim()).filter(Boolean); await p.saveSettings(); }));
     new Setting(containerEl).setName(t('settings.selective')).setDesc(t('settings.selectiveDesc'))
-      .addTextArea((el) => el.setValue(s.syncFolders.join('\n')).onChange(async (v) => { s.syncFolders = v.split('\n').map((x) => x.trim()).filter(Boolean); await p.saveSettings(); }));
+      .addTextArea((el) => el.setValue(s.syncFolders.join('\n')).onChange(async (v) => { s.syncFolders = v.split('\n').map((x) => x.trim()).filter(Boolean); await p.saveSettings(); }))
+      .addButton((b) => b.setButtonText(t('settings.chooseFolders')).onClick(() => p.chooseSyncFolders()));
     new Setting(containerEl).setName(t('settings.merge')).setDesc(t('settings.mergeDesc'))
       .addToggle((el) => el.setValue(s.mergeTextFiles).onChange(async (v) => { s.mergeTextFiles = v; await p.saveSettings(); }));
     new Setting(containerEl).setName(t('settings.stream')).setDesc(t('settings.streamDesc'))
@@ -401,11 +532,27 @@ class TdriveSettingTab extends PluginSettingTab {
     containerEl.createEl('h3', { text: t('sec.change') });
     new Setting(containerEl).setName(t('settings.syncOnChange')).setDesc(t('settings.syncOnChangeDesc'))
       .addToggle((el) => el.setValue(s.syncOnChange).onChange(async (v) => { s.syncOnChange = v; await p.saveSettings(); }));
+    new Setting(containerEl).setName(t('settings.instantSync')).setDesc(t('settings.instantSyncDesc'))
+      .addToggle((el) => el.setValue(s.instantSync).onChange(async (v) => { s.instantSync = v; await p.saveSettings(); }));
     new Setting(containerEl).setName(t('settings.syncOnChangeDelay')).setDesc(t('settings.syncOnChangeDelayDesc'))
       .addText((el) => el.setValue(String(s.syncOnChangeDelaySeconds)).onChange(async (v) => {
         const n = parseInt(v, 10); if (!Number.isFinite(n)) return;
-        s.syncOnChangeDelaySeconds = Math.min(300, Math.max(2, n)); await p.saveSettings();
+        s.syncOnChangeDelaySeconds = Math.min(300, Math.max(1, n)); await p.saveSettings();
       }));
+
+    containerEl.createEl('h3', { text: t('sec.speed') });
+    new Setting(containerEl).setName(t('settings.maxUploadKB')).setDesc(t('settings.throttleDesc'))
+      .addText((el) => el.setValue(String(s.maxUploadKBps)).onChange(async (v) => { const n = parseInt(v, 10); if (!Number.isFinite(n) || n < 0) return; s.maxUploadKBps = n; await p.saveSettings(); }));
+    new Setting(containerEl).setName(t('settings.maxDownloadKB')).setDesc(t('settings.throttleDesc'))
+      .addText((el) => el.setValue(String(s.maxDownloadKBps)).onChange(async (v) => { const n = parseInt(v, 10); if (!Number.isFinite(n) || n < 0) return; s.maxDownloadKBps = n; await p.saveSettings(); }));
+    new Setting(containerEl).setName(t('settings.schedule')).setDesc(t('settings.scheduleDesc'))
+      .addToggle((el) => el.setValue(s.scheduleEnabled).onChange(async (v) => { s.scheduleEnabled = v; await p.saveSettings(); }));
+    new Setting(containerEl).setName(t('settings.scheduleStart'))
+      .addText((el) => el.setValue(String(s.scheduleStart)).onChange(async (v) => { const n = parseInt(v, 10); if (!Number.isFinite(n)) return; s.scheduleStart = Math.min(23, Math.max(0, n)); await p.saveSettings(); }));
+    new Setting(containerEl).setName(t('settings.scheduleEnd')).setDesc(t('settings.scheduleEndDesc'))
+      .addText((el) => el.setValue(String(s.scheduleEnd)).onChange(async (v) => { const n = parseInt(v, 10); if (!Number.isFinite(n)) return; s.scheduleEnd = Math.min(23, Math.max(0, n)); await p.saveSettings(); }));
+    new Setting(containerEl).setName(t('settings.dedupe')).setDesc(t('settings.dedupeDesc'))
+      .addToggle((el) => el.setValue(s.dedupeUploads).onChange(async (v) => { s.dedupeUploads = v; await p.saveSettings(); }));
 
     containerEl.createEl('h3', { text: t('sec.bandwidth') });
     containerEl.createEl('p', { cls: 'tdrive-sync-hint', text: t('compress.note') });
@@ -477,6 +624,10 @@ class TdriveSyncPlugin extends Plugin {
     cmd('approve-deletes', 'cmd.approveDeletes', () => this.approveDeletes());
     cmd('restore-deletes', 'cmd.restoreDeletes', () => this.restoreDeletes());
     cmd('preview-sync', 'cmd.preview', () => this.previewSync());
+    cmd('view-versions', 'cmd.versions', () => this.viewVersions());
+    cmd('share-file', 'cmd.share', () => this.shareCurrent());
+    cmd('search-remote', 'cmd.search', () => this.searchRemote());
+    cmd('choose-folders', 'cmd.chooseFolders', () => this.chooseSyncFolders());
     cmd('view-conflicts', 'cmd.viewConflicts', () => this.activateView());
     cmd('view-sync-log', 'cmd.viewLog', () => this.activateView());
     cmd('export-log', 'cmd.exportLog', () => this.exportLog());
@@ -496,26 +647,44 @@ class TdriveSyncPlugin extends Plugin {
   /** (Re)computes the translation function from the language setting. */
   applyLanguage() { this.lang = resolveLang(this.settings.language); this.t = makeT(this.lang); if (this.local) this.local.t = this.t; }
 
+  /** True when auto-syncs are allowed right now (schedule window). Manual runs are never blocked by this. */
+  withinSchedule() {
+    const s = this.settings;
+    if (!s.scheduleEnabled) return true;
+    const h = new Date().getHours();
+    const a = Number(s.scheduleStart) || 0; const b = Number(s.scheduleEnd) || 0;
+    if (a === b) return true;
+    return a < b ? (h >= a && h < b) : (h >= a || h < b);   // wraps midnight when end < start
+  }
+
   /** Debounced auto-sync on local edits (opt-in). Sync's own writes are ignored via the running flag and a
-   *  short quiet window after each run, so a sync never re-triggers itself in a loop. */
+   *  short quiet window after each run, so a sync never re-triggers itself in a loop. "Instant" mode uses a 1s
+   *  debounce and also syncs when the app regains focus. */
   registerChangeSync() {
     const vault = this.app && this.app.vault;
     if (!vault || typeof vault.on !== 'function') return;   // adapter without events (tests/older builds)
     const schedule = (file) => {
-      if (!this.settings.syncOnChange || this.settings.paused) return;
+      if (!(this.settings.syncOnChange || this.settings.instantSync) || this.settings.paused) return;
       if (!this.settings.apiKey) return;
       if (this.engine && this.engine.running) return;
       if (Date.now() < this._quietUntil) return;
+      if (!this.withinSchedule()) return;
       const p = file && file.path ? String(file.path) : '';
       if (p.startsWith('.')) return;                        // .obsidian, hidden files, sync-state
       if (this._changeTimer) window.clearTimeout(this._changeTimer);
-      const delay = Math.max(2, Number(this.settings.syncOnChangeDelaySeconds) || 5) * 1000;
-      this._changeTimer = window.setTimeout(() => { this._changeTimer = null; this.runSync({ silent: true, reason: 'change' }); }, delay);
+      const secs = this.settings.instantSync ? 1 : Math.max(2, Number(this.settings.syncOnChangeDelaySeconds) || 5);
+      this._changeTimer = window.setTimeout(() => { this._changeTimer = null; this.runSync({ silent: true, reason: 'change' }); }, secs * 1000);
     };
     this.registerEvent(this.app.vault.on('modify', schedule));
     this.registerEvent(this.app.vault.on('create', schedule));
     this.registerEvent(this.app.vault.on('delete', schedule));
     this.registerEvent(this.app.vault.on('rename', (f) => schedule(f)));
+    // Near-instant: catch up as soon as the app is focused again (covers edits made while backgrounded).
+    if (typeof window !== 'undefined' && window.addEventListener) {
+      const onFocus = () => { if (this.settings.instantSync && !this.settings.paused && this.settings.apiKey && !(this.engine && this.engine.running) && this.withinSchedule()) this.runSync({ silent: true, reason: 'focus' }); };
+      window.addEventListener('focus', onFocus);
+      if (this.register) this.register(() => window.removeEventListener('focus', onFocus));
+    }
   }
 
   defaultRemoteFolder() { return '/Obsidian/' + this.app.vault.getName() + '/'; }
@@ -564,7 +733,7 @@ class TdriveSyncPlugin extends Plugin {
   }
 
   makeClient() {
-    const client = new TdriveClient({ baseUrl: this.settings.baseUrl, apiKey: this.settings.apiKey, transport: obsidianTransport });
+    const client = new TdriveClient({ baseUrl: this.settings.baseUrl, apiKey: this.settings.apiKey, transport: makeThrottledTransport(() => this.settings) });
     const known = this.ledger && this.ledger.data && this.ledger.data.meta && this.ledger.data.meta.uploadChunkSize;
     if (known) client._uploadChunk = known;   // reuse the server's enforced part size (avoids a re-opened session)
     // Retry notice (once per run, so notifications stay concise). Pure formatting; no engine change.
@@ -598,6 +767,7 @@ class TdriveSyncPlugin extends Plugin {
       maxFileBytes: this.settings.maxFileSizeMB > 0 ? this.settings.maxFileSizeMB * 1024 * 1024 : 0,
       cellularMaxFileBytes: this.settings.cellularMaxFileMB > 0 ? this.settings.cellularMaxFileMB * 1024 * 1024 : 0,
       streamThresholdBytes: this.settings.streamThresholdMB > 0 ? this.settings.streamThresholdMB * 1024 * 1024 : 8 * 1024 * 1024,
+      dedupeUploads: this.settings.dedupeUploads,
       networkIsCellular: networkLooksCellular,
     });
     let lastTick = 0;
@@ -733,13 +903,52 @@ class TdriveSyncPlugin extends Plugin {
     this.notify();
   }
 
+  /** The remote id we recorded for a local path (needed for versions / share links). */
+  remoteIdFor(path) {
+    const e = this.ledger.getFile(path);
+    return e && e.remoteId ? e.remoteId : null;
+  }
+
+  /** Lists archived versions of the current file and lets the user roll back to one. */
+  async viewVersions() {
+    const f = this.app.workspace.getActiveFile();
+    if (!f) { new Notice(this.t('notice.noOpenFile')); return; }
+    const id = this.remoteIdFor(f.path.normalize('NFC'));
+    if (!id) { new Notice(this.t('versions.notSynced')); return; }
+    new VersionsModal(this.app, this, f.path, id).open();
+  }
+
+  /** Creates a share link for the current file and copies it to the clipboard. */
+  async shareCurrent() {
+    const f = this.app.workspace.getActiveFile();
+    if (!f) { new Notice(this.t('notice.noOpenFile')); return; }
+    const id = this.remoteIdFor(f.path.normalize('NFC'));
+    if (!id) { new Notice(this.t('versions.notSynced')); return; }
+    try {
+      const r = await this.makeClient().request({ method: 'POST', path: `/files/${encodeURIComponent(id)}/shares`, headers: { 'Content-Type': 'application/json' }, body: new TextEncoder().encode(JSON.stringify({ permission: 'download' })).buffer });
+      const url = (r && (r.url || (r.share && r.share.url))) || '';
+      if (!url) throw new Error('no url');
+      try { await navigator.clipboard.writeText(url); new Notice(this.t('share.copied')); }
+      catch (e) { new Notice(this.t('share.here', { url }), 12000); }
+    } catch (e) { new Notice(this.t('share.failed', { msg: this.redact(e.message) }), 8000); }
+  }
+
+  /** Quick remote search (uses the server's own index). */
+  searchRemote() { new SearchModal(this.app, this).open(); }
+
+  /** Selective-sync folder picker. */
+  chooseSyncFolders() { new FolderPickerModal(this.app, this).open(); }
+
   async pause() { this.settings.paused = true; await this.saveSettings(); if (this.engine) this.engine.pause(); new Notice(this.t('notice.pausedDone')); this.notify(); }
   async resume() { this.settings.paused = false; await this.saveSettings(); new Notice(this.t('notice.resumedDone')); this.notify(); }
 
   setupAutoSync() {
     if (this._timer) { window.clearInterval(this._timer); this._timer = null; }
     const m = this.settings.autoSyncMinutes;
-    if (m > 0) { this._timer = window.setInterval(() => this.runSync({ silent: true }), m * 60000); this.registerInterval(this._timer); }
+    if (m > 0) {
+      this._timer = window.setInterval(() => { if (this.withinSchedule()) this.runSync({ silent: true }); }, m * 60000);
+      if (this.registerInterval) this.registerInterval(this._timer);
+    }
   }
 
   async activateView() {

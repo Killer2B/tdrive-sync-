@@ -1,5 +1,5 @@
 'use strict';
-const { asArrayBuffer, sha256Hex, randomUuid, uuidFromHex, pool, clamp } = require('./util');
+const { asArrayBuffer, sha256Hex, randomUuid, uuidFromHex, pool, clamp, sleep } = require('./util');
 const { normalizeFileResponse } = require('./normalize');
 const { cdcPlan, chooseChunker, normalizeChunker, fingerprintOf, fixed, hashPlan } = require('./Chunker');
 
@@ -26,12 +26,26 @@ const maxPart = (client, fallback) => {
   return clamp(remembered || fallback || MAX_PART_BYTES, 4096, MAX_PART_BYTES);
 };
 
+/** Asks the server which of these chunk hashes it already stores (≤500 per call). Returns a Set. */
+async function lookupStoredChunks(client, hashes) {
+  const out = new Set();
+  if (!hashes || !hashes.length || !client.chunksLookup) return out;
+  for (let i = 0; i < hashes.length; i += 500) {
+    const batch = hashes.slice(i, i + 500);
+    try {
+      const r = await client.chunksLookup(batch);
+      for (const h of (r && (r.available || r.chunks)) || []) out.add(h);
+    } catch (e) { /* lookup is an optimisation: on any error just send the bytes */ }
+  }
+  return out;
+}
+
 /**
  * Resumable upload with content-defined chunking (CDC): the boundaries follow the content, so a later edit only
  * changes a few chunks — which is what makes both incremental upload (revision reuse) and incremental download
  * (delta) effective. Falls back to a fixed one-chunk plan when the server does not accept a chunker.
  */
-async function uploadResumable(client, { name, folderPath, data, mtime, onProgress, concurrency, chunker, resolveChunk }) {
+async function uploadResumable(client, { name, folderPath, data, mtime, onProgress, concurrency, chunker, resolveChunk, dedupe }) {
   const bytes = new Uint8Array(data);
   const total = bytes.byteLength;
   const enc = encodeURIComponent;
@@ -70,8 +84,30 @@ async function uploadResumable(client, { name, folderPath, data, mtime, onProgre
   if (onProgress) onProgress(Math.min(done, total), total);
 
   const conc = clamp(Math.min(concurrency || 1, Number.isFinite(client._concurrencyHint) ? client._concurrencyHint : Infinity), 1, MAX_CONCURRENCY);
+  // Deduplicated upload: chunks that the server already stores (from any earlier upload) are claimed by hash
+  // with no bytes on the wire. This is the biggest saving when the same content exists in several files.
+  const stored = dedupe === false ? new Set() : await lookupStoredChunks(client, missing.map((i) => s.chunks[i].hash));
+  // Recently stored chunks may not be queryable yet (still draining to storage). If the first lookup found
+  // little, look the rest up once more after a short pause: one cheap JSON round-trip can save megabytes.
+  if (dedupe !== false && missing.length > 2) {
+    const stillMissing = missing.filter((i) => !stored.has(s.chunks[i].hash));
+    if (stillMissing.length > 2 && stored.size < missing.length * 0.9) {
+      await sleep(2500);
+      const again = await lookupStoredChunks(client, stillMissing.map((i) => s.chunks[i].hash));
+      for (const h of again) stored.add(h);
+    }
+  }
+  let reuseBroken = false;
   await pool(missing, conc, async (i) => {
     const c = s.chunks[i];
+    if (!reuseBroken && stored.has(c.hash)) {
+      try {
+        await client.request({ method: 'PUT', path: `/uploads/${enc(s.id)}/parts/${i}`, headers: { 'X-Content-SHA256': c.hash, 'X-Chunk-Reuse': '1', 'X-Chunk-Offset': String(c.offset), 'X-Chunk-Size': String(c.size) } });
+        done += c.size;
+        if (onProgress) onProgress(Math.min(done, total), total);
+        return;
+      } catch (e) { reuseBroken = true; /* fall through and send the bytes */ }
+    }
     await client.request({
       method: 'PUT', path: `/uploads/${enc(s.id)}/parts/${i}`,
       headers: { 'Content-Type': 'application/octet-stream', 'X-Content-SHA256': c.hash, 'X-Chunk-Offset': String(c.offset), 'X-Chunk-Size': String(c.size) },
@@ -161,7 +197,16 @@ async function uploadRevision(client, opts) {
     if (onProgress) onProgress(Math.min(done, total), total);
   });
 
-  const fin = await client.request({ method: 'POST', path: `/uploads/${enc(sid)}/complete` });
+  // The base's current version may still be finalising: the server answers a retryable 503 RevisionDeferred and
+  // the session stays pending. Retrying `complete` is safe (idempotent) and never creates a duplicate.
+  let fin; let deferred = 0;
+  for (;;) {
+    try { fin = await client.request({ method: 'POST', path: `/uploads/${enc(sid)}/complete` }); break; }
+    catch (e) {
+      if (e.status === 503 && deferred < 8) { deferred++; await sleep(Math.min(15000, (e.retryAfter ? e.retryAfter * 1000 : 2000) + deferred * 750)); continue; }
+      throw e;
+    }
+  }
   const srvCk = fin && (fin.checksum || (fin.file && fin.file.checksum));
   if (srvCk && srvCk !== fingerprint) throw new Error('Upload checksum mismatch reported by the server — the file was not stored correctly');
   const fid = (fin && (fin.id || fin.fileId || (fin.file && fin.file.id))) || id;
