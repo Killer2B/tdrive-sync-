@@ -200,7 +200,22 @@ function createMockServer(opts = {}) {
         const f = st.files.get(mm[1]); if (!f) return fail(res, 404, 'not_found', 'nope');
         if (m === 'GET') return ok(res, fileJson(f));
         if (m === 'DELETE') { if (u.searchParams.get('permanent') === '1') return fail(res, 400, 'refused', 'test'); f.trashed = true; note('trash', f.id); return ok(res, { id: f.id }); }
-        if (m === 'PATCH') { const j = JSON.parse(body.toString()); if (j.path) f.path = normFolder(j.path); if (j.name) f.name = j.name; note('rename', f.id); return ok(res, fileJson(f)); }
+        if (m === 'PATCH') {
+          const j = JSON.parse(body.toString());
+          if (j.path) f.path = normFolder(j.path);
+          if (j.name) f.name = j.name;
+          if (j.content && j.content.inline != null) {
+            // Inline content replacement (≤ one chunk): atomic, keeps the id, archives the previous content.
+            const bytes = Buffer.from(String(j.content.inline), 'base64');
+            if (bytes.length > st.oneShotMax) return fail(res, 413, 'too_large', 'inline content must fit one chunk');
+            f.versions = f.versions || []; f.versions.push({ version: (f.version || 1) + 1, bytes: f.bytes });
+            f.bytes = bytes; f.version = (f.version || 1) + 1; f.chunks = null; f.lastModified = tick();
+            storeChunks(bytes); note('revision', f.id);
+            return ok(res, { file: fileJson(f), content: { replaced: bytes.length } });
+          }
+          note('rename', f.id);
+          return ok(res, fileJson(f));
+        }
       }
       if ((mm = /^\/trash\/([^/]+)\/restore$/.exec(route)) && m === 'POST') { const f = st.files.get(mm[1]); if (f) f.trashed = false; note('restore', mm[1]); return ok(res, { id: mm[1] }); }
       if (m === 'DELETE' && (route === '/folders' || /^\/folders\/[^/]+$/.test(route))) {

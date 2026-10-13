@@ -50,11 +50,13 @@ test('4 retries after HTTP 429 honoring Retry-After', async () => {
   } finally { await env.stop(); }
 });
 
-test('4b 5xx retried with exponential backoff, then gives up with a retryable error', async () => {
+test('4b 5xx is retried with exponential backoff and, if it persists, gives up with a retryable error', async () => {
   const env = await makeEnv();
   try {
     env.server.failRule((i) => i.route === '/me', { status: 503 }, 99);
-    await assert.rejects(env.client.me(), (e) => e.status === 503 && e.retryable);
+    // A low server-retry cap keeps the backoff sequence deterministic for the test.
+    const c = env.mkClient(null, { maxRetries: 4, maxServerRetries: 4 });
+    await assert.rejects(c.me(), (e) => e.status === 503 && e.retryable);
     assert.deepEqual(env.sleeps, [500, 1000, 2000, 4000]);
   } finally { await env.stop(); }
 });

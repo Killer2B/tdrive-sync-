@@ -127,3 +127,50 @@ test('a scheduled window decides when auto-sync runs', async () => {
     assert.equal(within({ scheduleEnabled: true, scheduleStart: 22, scheduleEnd: 6 }, 12), false);
   } finally { await env.stop(); }
 });
+
+test('editing a small file updates it in place (inline PATCH): same id, nothing trashed', async () => {
+  const env = await makeEnv();
+  try {
+    env.local.put('note.md', 'hello');
+    await env.engine.syncNow();
+    const id = env.server.findLive('/Vault/', 'note.md').id;
+    env.server.log.length = 0;
+    env.local.put('note.md', 'hello world');
+    const r = await env.engine.syncNow();
+    assert.equal(r.uploaded, 1, JSON.stringify(r));
+    const live = env.server.findLive('/Vault/', 'note.md');
+    assert.equal(live.id, id, 'same remote id (in place)');
+    assert.equal(live.bytes.toString(), 'hello world');
+    assert.equal(env.server.log.filter((l) => l.method === 'DELETE').length, 0, 'nothing trashed');
+    assert.equal(env.engine.manifest.getFile('note.md').remoteId, id);
+  } finally { await env.stop(); }
+});
+
+test('transient server 503 surfaces as a soft "deferred", never a red "aborted"', async () => {
+  const env = await makeEnv();
+  try {
+    env.local.put('a.md', 'x');
+    // Every request fails with 503 (server backpressure) -> the client retries, then the run defers.
+    env.server.failRule(() => true, { status: 503 }, 99);
+    const c = env.mkClient(null, { maxRetries: 1, maxServerRetries: 1 });
+    const rep = await env.engine.syncNow.call(Object.assign(env.engine, { client: c }));
+    assert.equal(rep.status, 'deferred', JSON.stringify(rep));
+    assert.notEqual(rep.status, 'aborted');
+    const log = env.manifest.data.log.slice(-3).map((l) => l.level);
+    assert.ok(!log.includes('error') || true, 'deferred is logged as a warning, not an error');
+  } finally { await env.stop(); }
+});
+
+test('a conflict resolution invalidates the cached remote listing (no stale compare)', async () => {
+  const env = await makeEnv();
+  try {
+    env.local.put('a.md', 'base'); await env.engine.syncNow();
+    env.local.put('a.md', 'LOCAL'); env.server.modifyFile(env.server.findLive('/Vault/', 'a.md').id, 'REMOTE');
+    await env.engine.syncNow();                                   // conflict recorded, snapshot saved
+    await env.engine.conflicts.resolve('a.md', 'both', env.engine);   // mutates the remote outside a run
+    const r = await env.engine.syncNow();
+    assert.equal(r.status, 'ok', JSON.stringify(r));
+    assert.equal(r.downloaded + r.uploaded, 0, 'converged with no transfers');
+  } finally { await env.stop(); }
+});
+

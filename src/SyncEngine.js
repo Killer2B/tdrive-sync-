@@ -63,6 +63,13 @@ class SyncEngine {
   _upOpts() { const s = this.getSettings(); return { chunkBytes: s.uploadChunkBytes, concurrency: s.maxConcurrentParts, crypto: this.crypto, compressor: this.compressor, dedupe: s.dedupeUploads !== false }; }
   _downOpts() { const s = this.getSettings(); return { chunkBytes: s.downloadChunkBytes, concurrency: s.maxConcurrentParts, crypto: this.crypto, compressor: this.compressor }; }
 
+  /** Marks that this run changed the remote AND drops any cached remote listing, so a mutation made outside a
+   *  normal run (conflict resolution, one-file upload, version restore) can never leave a stale snapshot behind. */
+  _markRemoteMutated() {
+    this._remoteMutated = true;
+    if (this.manifest && this.manifest.data && this.manifest.data.meta) delete this.manifest.data.meta.remoteSnapshot;
+  }
+
   /** Emits byte-level progress for the file currently being transferred. */
   _fileProgress(key, action) {
     return (done, total) => this.onProgress({ phase: 'sync', current: key, action, bytes: { done: done || 0, total: total || 0 } });
@@ -316,7 +323,7 @@ class SyncEngine {
       if (this._folders.has(key)) continue;
       const idx = await this._dirIndex(parent);
       if (!idx.folders.has(nfc(seg))) {
-        try { await this.client.createFolder(seg, parent); this._remoteMutated = true; }
+        try { await this.client.createFolder(seg, parent); this._markRemoteMutated(); }
         catch (e) { if (!(e.status === 409 || /exist/i.test(e.code + ' ' + e.message))) throw e; }
         idx.folders.add(nfc(seg));
       }
@@ -325,25 +332,35 @@ class SyncEngine {
   }
 
   // ---------- primitive operations ----------
-  async _replaceUpload({ name, folderPath, data, mtime, old, onProgress, chunker, allowRevision }) {
+  async _replaceUpload({ name, folderPath, data, mtime, old, onProgress, chunker }) {
     // In-place update first: when replacing a file we already have on the server, a revision sends ONLY the
     // changed chunks (unchanged chunks are reused server-side), commits atomically, and keeps the same file id.
-    // Falls back to the normal create+trash path when a revision does not apply or the server declines it.
-    if (old && old.id && this.revisionFn && allowRevision !== false) {
+    if (old && old.id && this.revisionFn) {
       try {
         const rev = await this.revisionFn(this.client, { id: old.id, name, folderPath, data, mtime, onProgress, chunker, ...this._upOpts() });
         if (rev && rev.id) {
-          this._remoteMutated = true;
+          this._markRemoteMutated();
           if (rev.name && rev.name !== name) return { ...(await this.client.rename(rev.id, name)), ...rev, name };
           return rev;
         }
       } catch (e) {
-        // Auth/network must propagate; any other rejection (bad base, draining, unsupported) means
-        // "revision not usable right now" -> fall back to uploading a new version.
+        // Auth/network must propagate; any other rejection means "revision not usable right now".
         if (e && (e.status === 401 || e.status === 403 || e.isNetwork)) throw e;
-        this.log('warn', `In-place update unavailable for ${name} (${this.client.redact(e.message)}); uploading a new version.`);
+      }
+      // Small file (or a revision that did not apply): replace the content IN PLACE via the inline PATCH form,
+      // which runs through the same atomic revision engine (no new file, no trash, previous version archived).
+      try {
+        const patched = await this.client.patchContent(old.id, data);
+        if (patched && patched.id) {
+          this._markRemoteMutated();
+          if (patched.name && patched.name !== name) return { ...(await this.client.rename(patched.id, name)), ...patched, name };
+          return patched;
+        }
+      } catch (e) {
+        if (e && (e.status === 401 || e.status === 403 || e.isNetwork)) throw e;
       }
     }
+    // Generic path (only when neither in-place form is available). Not an error, just the fallback.
     const attempt = () => this.uploadFn(this.client, { name, folderPath, data, mtime, onProgress, chunker, ...this._upOpts() });
     let trashed = false; let res;
     try { res = await attempt(); }
@@ -370,7 +387,7 @@ class SyncEngine {
     const lhash = await sha256Hex(data);
     const { dir, name } = splitRel(rel);
     await this._ensureFolders(dir);
-    this._remoteMutated = true;
+    this._markRemoteMutated();
     const folderPath = folderPathFor(this.getSettings().remoteFolder, dir);
     // No known remote copy: a file with this name may still be there (listing gap, lost ledger).
     // Replace it rather than adding a second copy next to it.
@@ -421,7 +438,7 @@ class SyncEngine {
     this._runId = this.now(); this._dryRun = false; this._pendingSnapshot = null; this._remoteMutated = false;
     const s = this.getSettings();
     const mode = opts.mode || s.mode || 'two-way';
-    let netFails = 0; let lock = null;
+    let netFails = 0; let serverFails = 0; let lock = null;
     try {
       await this.client.limits();               // validates the key + discovers upload limits
       const remoteChanged = await this._remoteChangedSinceSnapshot();   // read BEFORE the lock churns /activity
@@ -572,7 +589,7 @@ class SyncEngine {
             }
           }
           await this._execute(p, rep);
-          netFails = 0;
+          netFails = 0; serverFails = 0;
           // Persist progress regularly: if Obsidian is killed mid-run (Android) finished files are not re-compared.
           if (++sinceSave >= 20) { sinceSave = 0; try { await this.manifest.save(); } catch (_) { /* retried at the end */ } }
         } catch (e) {
@@ -580,6 +597,8 @@ class SyncEngine {
           this.log('error', `${p.action} ${p.key}: ${e.message}`);
           if (e.status === 401 || e.status === 403) { rep.status = 'auth'; break; }
           if (e.isNetwork && ++netFails >= 3) { rep.status = 'offline'; break; }
+          // Repeated server backpressure (503 "freeing storage"): stop hammering and retry later.
+          if (e.status >= 500 && ++serverFails >= 3) { rep.status = 'deferred'; break; }
         }
       }
 
@@ -596,9 +615,12 @@ class SyncEngine {
       // ---- refresh remote signatures of what we touched (list-shape == future-listing shape) ----
       if (this._touched.size && rep.status !== 'auth' && rep.status !== 'offline') await this._reconcile(rep);
     } catch (e) {
-      rep.status = e.status === 401 || e.status === 403 ? 'auth' : (e.isNetwork ? 'offline' : 'aborted');
+      const transient = e.status >= 500 || e.status === 429;
+      rep.status = e.status === 401 || e.status === 403 ? 'auth' : (transient ? 'deferred' : (e.isNetwork ? 'offline' : 'aborted'));
       rep.failures.push({ path: '', error: this.client.redact(e.message) });
-      this.log('error', `Sync aborted: ${e.message}`);
+      // Transient server backpressure is expected and retried: log it as a warning, not a scary error.
+      if (transient) this.log('warn', `Server busy; sync will retry later: ${this.client.redact(e.message)}`);
+      else this.log('error', `Sync aborted: ${e.message}`);
     } finally {
       await this._releaseLock(lock);
       if (this._dryRun) { this.running = false; return rep; }
@@ -636,7 +658,7 @@ class SyncEngine {
     const existing = idx.files.get(nfc(name));
     if (existing && existing.id !== src.R.id) return false;
     const res = await this.client.move(src.R.id, { name, path: folderPath });
-    this._remoteMutated = true;
+    this._markRemoteMutated();
     const lstat = await this.local.stat(up.key);
     this._record(up.key, { lhash: up.lhash, lstat, remote: res });
     this.manifest.deleteFile(src.key);
@@ -738,7 +760,7 @@ class SyncEngine {
         else { await this.conflicts.record(key, R, rdata); rep.conflicts++; }
         break;
       }
-      case 'deleteRemote': await this.client.trash(R.id); this._remoteMutated = true; this.manifest.deleteFile(key); rep.deletedRemote++; this._auditDelete(key, 'remote', R.id); break;
+      case 'deleteRemote': await this.client.trash(R.id); this._markRemoteMutated(); this.manifest.deleteFile(key); rep.deletedRemote++; this._auditDelete(key, 'remote', R.id); break;
       case 'deleteLocal': await this.local.trash(key); this.manifest.deleteFile(key); rep.deletedLocal++; this._auditDelete(key, 'local', null); break;
       default: break;
     }
@@ -879,7 +901,7 @@ class SyncEngine {
           try { live = await this.client.listFolder(remotePath); }
           catch (e) { if (e.status !== 404) throw e; }
           if (live && (live.files.some((f) => !f.trashed) || live.folders.length)) continue;   // not empty: keep
-          if (live) { const meta = this._remoteDirs && this._remoteDirs.get(d); await this.client.deleteFolder(remotePath, meta && meta.id); this._remoteMutated = true; }
+          if (live) { const meta = this._remoteDirs && this._remoteDirs.get(d); await this.client.deleteFolder(remotePath, meta && meta.id); this._markRemoteMutated(); }
           deletedRemote.add(d); this.manifest.deleteFolder(d); rep.deletedRemote++; dels++;
           this.log('info', `Deleted remote folder (to trash): ${d}`);
         } else {                                            // deleted remotely

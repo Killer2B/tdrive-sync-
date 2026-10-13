@@ -42,6 +42,7 @@ class TdriveClient {
     this.transport = opts.transport;
     this.sleep = opts.sleep || sleep;
     this.maxRetries = opts.maxRetries == null ? 4 : opts.maxRetries;
+    this.maxServerRetries = opts.maxServerRetries == null ? 12 : opts.maxServerRetries;   // transient 5xx: be patient
     this.baseDelayMs = opts.baseDelayMs == null ? 500 : opts.baseDelayMs;
     this.maxDelayMs = opts.maxDelayMs == null ? 30000 : opts.maxDelayMs;
     this._info = null;
@@ -57,20 +58,30 @@ class TdriveClient {
   }
 
   async _wait(attempt, retryAfter) {
-    const d = retryAfter != null ? Math.min(retryAfter * 1000, this.maxDelayMs)
-      : Math.min(this.baseDelayMs * Math.pow(2, attempt), this.maxDelayMs);
-    await this.sleep(d);
+    // Honour the server's Retry-After as a FLOOR, but keep growing exponentially so a long outage (small
+    // Retry-After repeated many times, e.g. ControlUnavailable) does not hammer the server.
+    const fromHeader = retryAfter != null ? Math.min(retryAfter * 1000, this.maxDelayMs) : 0;
+    const backoff = Math.min(this.baseDelayMs * Math.pow(2, attempt), this.maxDelayMs);
+    await this.sleep(Math.max(fromHeader, backoff));
   }
 
   _httpError(res) {
-    let code = 'http_' + res.status; let message = 'HTTP ' + res.status;
+    let code = 'http_' + res.status; let message = 'HTTP ' + res.status; let bodyRetry = null;
     try {
       const j = JSON.parse(new TextDecoder().decode(res.body));
-      if (j && j.error) { code = j.error.code || code; message = j.error.message || message; }
+      if (j) {
+        // Two shapes are seen live: the documented { ok:false, error:{ code, message } } and a bare
+        // { error:"Code", code, retryAfter } (used by transient ControlUnavailable / storage backpressure).
+        if (j.error && typeof j.error === 'object') { code = j.error.code || code; message = j.error.message || message; }
+        else if (j.code && j.error) { code = j.code; message = typeof j.error === 'string' ? j.error : (j.message || message); }
+        else if (j.error && typeof j.error === 'string') { code = j.code || j.error; message = j.message || j.error; }
+        if (j.retryAfter != null) bodyRetry = Number(j.retryAfter);
+      }
     } catch (e) { /* non-JSON error body */ }
+    const headerRetry = parseRetryAfter(res.headers && res.headers['retry-after']);
     return new TdriveError(this.redact(message), {
       status: res.status, code, retryable: res.status === 429 || res.status >= 500,
-      retryAfter: parseRetryAfter(res.headers && res.headers['retry-after']),
+      retryAfter: headerRetry != null ? headerRetry : bodyRetry,
     });
   }
 
@@ -94,7 +105,10 @@ class TdriveClient {
           this._concurrencyHint = Math.max(1, cur - 1);
         }
         const err = this._httpError(res);
-        if (attempt >= this.maxRetries) throw err;
+        // 5xx is transient server backpressure ("Freeing storage space — retrying shortly"): be more patient
+        // than for other errors and always honour Retry-After, so a short outage does not fail the whole run.
+        const cap = res.status >= 500 ? this.maxServerRetries : this.maxRetries;
+        if (attempt >= cap) throw err;
         if (this.onRetry) { try { this.onRetry({ attempt: attempt + 1, status: res.status, retryAfter: err.retryAfter }); } catch (_) { /* hook only */ } }
         await this._wait(attempt, err.retryAfter);
         continue;
@@ -281,8 +295,24 @@ class TdriveClient {
     }));
   }
 
-  async rename(id, name) { return this._patch(id, { name }); }
+  /** Replaces a file's content in place when it fits in one chunk (≤ oneShotMaxBytes). Runs through the same
+   *  revision engine as the resumable path: atomic swap, previous content kept as a version, id/name/path kept.
+   *  Returns the updated file, or null when the payload is too large for the inline form. */
+  async patchContent(id, data) {
+    const lim = await this.limits();
+    const buf = data instanceof ArrayBuffer ? new Uint8Array(data) : new Uint8Array(data.buffer, data.byteOffset || 0, data.byteLength);
+    if (buf.byteLength > lim.oneShotMaxBytes) return null;
+    let b64 = '';
+    try { b64 = btoa(String.fromCharCode(...buf)); }
+    catch (e) { // large-ish payloads exceed the argument limit: encode in chunks
+      let s = ''; for (let i = 0; i < buf.length; i += 0x8000) s += String.fromCharCode.apply(null, buf.subarray(i, i + 0x8000));
+      b64 = btoa(s);
+    }
+    const r = await this._patch(id, { content: { inline: b64 } });
+    return r && r.id ? r : null;
+  }
 
+  async rename(id, name) { return this._patch(id, { name }); }
   /** Renames and/or moves a file in place (no re-upload). The real server handles `name` and `path` reliably only
    *  as SEPARATE PATCH calls (a combined body can silently ignore one of them), so they are issued one by one. */
   async move(id, { name, path } = {}) {

@@ -65,7 +65,7 @@ function reasonLabel(t, reason) {
 }
 
 function statusLabel(t, status) {
-  const map = { offline: 'notify.state.offline', auth: 'notify.state.auth', paused: 'notify.state.paused', locked: 'notify.state.locked', busy: 'notify.state.busy', aborted: 'notify.state.aborted' };
+  const map = { offline: 'notify.state.offline', auth: 'notify.state.auth', paused: 'notify.state.paused', locked: 'notify.state.locked', busy: 'notify.state.busy', aborted: 'notify.state.aborted', deferred: 'notify.state.deferred' };
   return map[status] ? t(map[status]) : String(status || '');
 }
 

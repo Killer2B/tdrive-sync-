@@ -811,7 +811,10 @@ class TdriveSyncPlugin extends Plugin {
     }
     const blockedNotice = NOTIFY.formatWarning(style, this.t, rep);
     if (blockedNotice && !opts.silent) this.showNotice(blockedNotice);
-    if (!opts.silent) this.showNotice(NOTIFY.formatResult(style, this.t, rep));
+    if (rep.status === 'deferred') {
+      // The server is briefly busy (retried, still deferred). Treat it as "try again soon", not a failure.
+      if (!opts.silent) this.showNotice({ style, text: (style === 'technical' ? `Tdrive: ${this.t('notify.state.deferred')}` : this.t('notify.state.deferred')), rows: style === 'technical' ? null : [[{ icon: 'retry', text: this.t('notify.state.deferred') }]], timeout: 9000 });
+    } else if (!opts.silent) this.showNotice(NOTIFY.formatResult(style, this.t, rep));
     this._quietUntil = Date.now() + 3000;   // ignore our own writes firing vault events right after
     // Remember the server's real part size so the next run does not re-open a probe session.
     const ch = this.engine && this.engine.client && this.engine.client._uploadChunk;

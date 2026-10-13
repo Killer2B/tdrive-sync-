@@ -1,6 +1,6 @@
 {
   "name": "tdrive-sync",
-  "version": "1.7.0",
+  "version": "1.7.1",
   "description": "Obsidian plugin: two-way sync with Tdrive",
   "private": true,
   "scripts": {
