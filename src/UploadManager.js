@@ -95,6 +95,108 @@ async function uploadResumable(client, { name, folderPath, data, mtime, onProgre
   return f;
 }
 
+/**
+ * In-place content update ("revision"): writes a new version of an EXISTING file, transferring only the parts
+ * that changed. Unchanged parts are reused server-side by SHA-256 (X-Chunk-Reuse: 1, no bytes on the wire).
+ * The commit is atomic and the file keeps its id, name, path and share links.
+ *
+ * Returns the updated file on success, or null when a revision does not apply (single-part file, server without
+ * revision support) so the caller can fall back to the normal create path. Auth/network errors still throw.
+ */
+async function uploadRevision(client, opts) {
+  const { id, mtime, onProgress, concurrency } = opts;
+  let data = asArrayBuffer(opts.data);        // accept a Buffer or ArrayBuffer transparently
+  // Apply the SAME preparation as a normal upload (shrink then encrypt), so reused chunks match the base's
+  // stored chunks and nothing is ever stored in the clear when E2EE is on. (Encryption randomises the payload,
+  // so with E2EE on nothing is reused — expected; the file is simply re-sent.)
+  if (opts.compressor) data = await opts.compressor.maybeCompress(opts.name, data);
+  if (opts.crypto) data = await opts.crypto.encrypt(data);
+  const total = data.byteLength;
+  const enc = encodeURIComponent;
+  const hint = Number.isFinite(client._concurrencyHint) ? client._concurrencyHint : Infinity;
+
+  const guess = Number.isFinite(client._uploadChunk) && client._uploadChunk > 0 ? client._uploadChunk
+    : (Number.isFinite(opts.chunkBytes) && opts.chunkBytes > 0 ? opts.chunkBytes : MAX_PART_BYTES);
+
+  // Open a revision session for a given part size. The fingerprint covers the exact parts, so it is computed here.
+  const open = async (chunk) => {
+    const n = Math.max(1, Math.ceil(total / chunk));
+    const hashes = new Array(n);
+    for (let i = 0; i < n; i++) {
+      const start = i * chunk;
+      hashes[i] = await sha256HexView(data, start, Math.min(start + chunk, total) - start);
+    }
+    const fingerprint = await sha256Hex(hashes.join('\n'));
+    const sess = await client.request({
+      method: 'POST', path: '/uploads', headers: { 'Content-Type': 'application/json' },
+      body: json({ baseId: id, mode: 'replace', size: total, fingerprint, clientKey: randomUuid(), contentType: 'application/octet-stream', lastModified: mtime || Date.now() }),
+    });
+    const sid = sess && (sess.id || sess.uploadId);
+    if (!sid) return null;
+    const srv = Number(sess && sess.chunkSize);
+    return { sid, chunk, n, hashes, fingerprint, sess, srvChunk: Number.isFinite(srv) && srv > 0 ? srv : null };
+  };
+
+  let s = await open(clamp(Math.min(guess, MAX_PART_BYTES), MIN_PART_BYTES, MAX_PART_BYTES));
+  if (!s) return null;
+  if (s.n <= 1) { try { await client.request({ method: 'DELETE', path: '/uploads/' + enc(s.sid) }); } catch (e) { /* abort */ } return null; }
+  // A revision always uses the base file's part size; if it differs from the guess, reopen with the right one.
+  if (s.srvChunk && s.srvChunk !== s.chunk) {
+    try { await client.request({ method: 'DELETE', path: '/uploads/' + enc(s.sid) }); } catch (e) { /* abort */ }
+    s = await open(s.srvChunk);
+    if (!s) return null;
+  }
+  client._uploadChunk = s.chunk;
+  const isRevision = s.sess && (s.sess.revision === true || (s.sess.base && Array.isArray(s.sess.base.parts)));
+  if (!isRevision) { try { await client.request({ method: 'DELETE', path: '/uploads/' + enc(s.sid) }); } catch (e) { /* abort */ } return null; }
+
+  const chunk = s.chunk; const n = s.n; const hashes = s.hashes; const sid = s.sid;
+  // Which parts the base already stores, by hash -> we can claim them without sending bytes.
+  const reusable = new Set();
+  const baseParts = (s.sess.base && s.sess.base.parts) || s.sess.parts || [];
+  if (Array.isArray(baseParts)) for (const p of baseParts) if (p && p.checksum) reusable.add(p.checksum);
+
+  const received = new Set(((s.sess.received) || []).map(partIdx).filter((x) => Number.isInteger(x)));
+  const missing = []; let done = 0; let reused = 0;
+  for (let i = 0; i < n; i++) {
+    const len = Math.min(chunk, total - i * chunk);
+    if (received.has(i)) done += len; else missing.push(i);
+  }
+  if (onProgress) onProgress(Math.min(done, total), total);
+
+  const conc = clamp(Math.min(concurrency || 1, hint), 1, MAX_CONCURRENCY);
+  let reuseBroken = false;   // once a reuse is refused, stop trying (send bytes for the rest)
+  await pool(missing, conc, async (i) => {
+    const start = i * chunk;
+    const len = Math.min(chunk, total - start);
+    if (!reuseBroken && reusable.has(hashes[i])) {
+      try {
+        await client.request({ method: 'PUT', path: `/uploads/${enc(sid)}/parts/${i}`, headers: { 'X-Content-SHA256': hashes[i], 'X-Chunk-Reuse': '1' } });
+        reused++; done += len;
+        if (onProgress) onProgress(Math.min(done, total), total);
+        return;
+      } catch (e) { reuseBroken = true; /* fall through: send the bytes */ }
+    }
+    await client.request({
+      method: 'PUT', path: `/uploads/${enc(sid)}/parts/${i}`,
+      headers: { 'Content-Type': 'application/octet-stream', 'X-Content-SHA256': hashes[i] },
+      body: data.slice(start, start + len),
+    });
+    done += len;
+    if (onProgress) onProgress(Math.min(done, total), total);
+  });
+
+  const fin = await client.request({ method: 'POST', path: `/uploads/${enc(sid)}/complete` });
+  const srvCk = fin && (fin.checksum || (fin.file && fin.file.checksum));
+  if (srvCk && srvCk !== s.fingerprint) throw new Error('Upload checksum mismatch reported by the server — the file was not stored correctly');
+  const fid = (fin && (fin.id || fin.fileId || (fin.file && fin.file.id))) || id;
+  let f = normalizeFileResponse(fin);
+  if (!f || !f.id || f.size == null) f = await client.getFile(fid);
+  if (f.size != null && f.size !== total) throw new Error(`Upload size mismatch: server ${f.size} vs ${total}`);
+  f.reusedParts = reused;
+  return f;
+}
+
 async function uploadFile(client, opts) {
   let data = asArrayBuffer(opts.data);
   // Shrink first (text-like files only), then encrypt: compressing ciphertext would do nothing. Both steps
@@ -109,4 +211,5 @@ async function uploadFile(client, opts) {
   return uploadResumable(client, { ...opts, data }, provisional);
 }
 
-module.exports = { uploadFile, uploadOneShot, uploadResumable, MAX_PART_BYTES };
+module.exports = { uploadFile, uploadRevision, uploadOneShot, uploadResumable, MAX_PART_BYTES };
+

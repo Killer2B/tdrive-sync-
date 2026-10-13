@@ -2,7 +2,7 @@
 const { sha256Hex, nfc, splitRel, splitPath, folderPathFor, makeExcluder, bytesToHuman, randomUuid } = require('./util');
 const { remoteSig, normalizeFileResponse } = require('./normalize');
 const { ConflictManager } = require('./ConflictManager');
-const { uploadFile } = require('./UploadManager');
+const { uploadFile, uploadRevision } = require('./UploadManager');
 const { downloadFile } = require('./DownloadManager');
 
 const emptyReport = () => ({
@@ -38,11 +38,12 @@ const safePlatform = () => {
 };
 
 class SyncEngine {
-  constructor({ client, local, manifest, getSettings, onProgress, now, uploadFn, downloadFn, crypto, compressor }) {
+  constructor({ client, local, manifest, getSettings, onProgress, now, uploadFn, downloadFn, crypto, compressor, revisionFn }) {
     this.client = client; this.local = local; this.manifest = manifest; this.getSettings = getSettings;
     this.onProgress = onProgress || (() => {});
     this.now = now || (() => Date.now());
     this.uploadFn = uploadFn || uploadFile;
+    this.revisionFn = revisionFn || uploadRevision;   // in-place update (only changed chunks)
     this.downloadFn = downloadFn || downloadFile;
     this.crypto = crypto || null;   // optional { encrypt, decrypt } (E2EE); null = plaintext
     this.compressor = compressor || null;   // optional { maybeCompress, decompress }; null = store as-is
@@ -257,6 +258,24 @@ class SyncEngine {
 
   // ---------- primitive operations ----------
   async _replaceUpload({ name, folderPath, data, mtime, old, onProgress }) {
+    // In-place update first: when replacing a file we already have on the server, a revision sends ONLY the
+    // changed parts (unchanged parts are reused server-side), commits atomically, and keeps the same file id.
+    // Falls back to the normal create+trash path when a revision does not apply or the server declines it.
+    if (old && old.id && this.revisionFn) {
+      try {
+        const rev = await this.revisionFn(this.client, { id: old.id, name, folderPath, data, mtime, onProgress, ...this._upOpts() });
+        if (rev && rev.id) {
+          this._remoteMutated = true;
+          if (rev.name && rev.name !== name) return { ...(await this.client.rename(rev.id, name)), ...rev, name };
+          return rev;
+        }
+      } catch (e) {
+        // Auth/network must propagate; any other rejection (bad base, draining, unsupported) means
+        // "revision not usable right now" -> fall back to uploading a new version.
+        if (e && (e.status === 401 || e.status === 403 || e.isNetwork)) throw e;
+        this.log('warn', `In-place update unavailable for ${name} (${this.client.redact(e.message)}); uploading a new version.`);
+      }
+    }
     const attempt = () => this.uploadFn(this.client, { name, folderPath, data, mtime, onProgress, ...this._upOpts() });
     let trashed = false; let res;
     try { res = await attempt(); }

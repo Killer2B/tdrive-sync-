@@ -10,6 +10,7 @@ const normFolder = (p) => { p = p || '/'; if (!p.startsWith('/')) p = '/' + p; i
 function createMockServer(opts = {}) {
   const st = {
     key: 'tdk_testkey1234567890', files: new Map(), folders: new Set(['/']), uploads: new Map(), idem: new Map(),
+    chunkStore: new Map(), noRevisions: !!opts.noRevisions,
     nextId: 1, clock: 1_700_000_000_000, log: [], rules: [],
     dup: opts.dup || 'allow', requireFolders: opts.requireFolders !== false,
     maxBody: opts.maxBody || 0, maxSeen: 0,
@@ -18,6 +19,8 @@ function createMockServer(opts = {}) {
     oneShotMax: opts.oneShotMax || 1024 * 1024, chunk: opts.chunk || 1024 * 1024,
   };
   const tick = () => (st.clock += 1000);
+  // The part size a session actually enforces: the advertised chunk, capped by any hard request-body limit.
+  const effChunk = () => (st.maxBody ? Math.min(st.chunk, st.maxBody) : st.chunk);
   const fileJson = (f) => ({ id: f.id, name: f.name, path: f.path, size: f.bytes.length, lastModified: f.lastModified, trashed: f.trashed });
   const live = () => [...st.files.values()].filter((f) => !f.trashed);
   // Activity recorded by requests during a sync must look OLDER than the engine's snapshot stamp; activity
@@ -36,7 +39,24 @@ function createMockServer(opts = {}) {
       name = `${base} (${n})${ext}`;
     }
     const f = { id: 'f' + st.nextId++, name, path, bytes: Buffer.from(bytes), lastModified: lastModified || tick(), trashed: false };
-    st.files.set(f.id, f); return { f };
+    st.files.set(f.id, f); storeChunks(f.bytes); return { f };
+  }
+  // Every stored (non-empty) chunk is indexed by its SHA-256, so a later revision can reuse it without bytes.
+  function storeChunks(buf) {
+    const size = effChunk();
+    if (buf.length === 0) return;
+    for (let o = 0; o < buf.length; o += size) {
+      const p = buf.subarray(o, Math.min(o + size, buf.length));
+      if (p.length) st.chunkStore.set(sha(p), Buffer.from(p));
+    }
+  }
+  function chunkRows(file, size) {
+    const out = []; const n = Math.max(1, Math.ceil(file.bytes.length / size));
+    for (let i = 0; i < n; i++) {
+      const p = file.bytes.subarray(i * size, Math.min((i + 1) * size, file.bytes.length));
+      out.push({ idx: i, size: p.length, checksum: sha(p) });
+    }
+    return out;
   }
   st.addFile = (path, name, data) => { addFolder(path); const f = createFile(name, path, Buffer.from(data)).f; noteExternal('upload', f.id); return f; };
   st.modifyFile = (id, data) => { const f = st.files.get(id); f.bytes = Buffer.from(data); f.lastModified = tick(); noteExternal('update', id); return f; };
@@ -153,20 +173,55 @@ function createMockServer(opts = {}) {
         const j = JSON.parse(body.toString());
         if (!/^[0-9a-f-]{36}$/.test(j.clientKey)) return fail(res, 400, 'bad_key', 'clientKey must be uuid');
         let s = [...st.uploads.values()].find((x) => x.clientKey === j.clientKey);
-        if (!s) { s = { id: 'u' + st.nextId++, ...j, parts: new Map(), done: null }; st.uploads.set(s.id, s); }
-        return ok(res, { id: s.id }, 201);
+        if (!s) {
+          s = { id: 'u' + st.nextId++, ...j, parts: new Map(), done: null, reuse: new Set() };
+          // A revision session targets an existing file and exposes its stored parts (by checksum) for reuse.
+          if (j.baseId) {
+            const base = st.files.get(j.baseId);
+            if (!base || base.trashed) return fail(res, 404, 'not_found', 'no base file');
+            if (st.noRevisions) return fail(res, 400, 'invalid_request', 'revisions not supported');
+            s.base = { id: j.baseId, parts: chunkRows(base, effChunk()) };
+          }
+          st.uploads.set(s.id, s);
+        }
+        const out = { id: s.id, chunkSize: effChunk(), totalChunks: Math.max(1, Math.ceil(s.size / effChunk())), received: [...s.parts.keys()], uncertain: [], inProgress: [] };
+        if (s.base) { out.revision = true; out.base = s.base; }
+        return ok(res, out, 201);
       }
       if ((mm = /^\/uploads\/([^/]+)\/parts\/(\d+)$/.exec(route)) && m === 'PUT') {
         const s = st.uploads.get(mm[1]); if (!s) return fail(res, 404, 'not_found', 'no session');
-        if (sha(body) !== req.headers['x-content-sha256']) return fail(res, 400, 'checksum', 'bad checksum');
-        s.parts.set(Number(mm[2]), body); return ok(res, { idx: Number(mm[2]) });
+        const idx = Number(mm[2]);
+        if (req.headers['x-chunk-reuse'] === '1') {
+          // Claim an already-stored chunk with no body — only honoured when the base really stores that hash.
+          const want = req.headers['x-content-sha256'];
+          const row = s.base && s.base.parts[idx];
+          if (!row || row.checksum !== want || !st.chunkStore.has(want)) return fail(res, 409, 'ChunkNotAvailable', 'not stored server-side');
+          s.reuse.add(idx); s.parts.set(idx, st.chunkStore.get(want));
+          return ok(res, { idx, reused: true });
+        }
+        if (body.length && sha(body) !== req.headers['x-content-sha256']) return fail(res, 400, 'checksum', 'bad checksum');
+        s.parts.set(idx, body); st.chunkStore.set(sha(body), body);
+        return ok(res, { idx });
       }
       if ((mm = /^\/uploads\/([^/]+)\/complete$/.exec(route)) && m === 'POST') {
         const s = st.uploads.get(mm[1]); if (!s) return fail(res, 404, 'not_found', 'no session');
         if (s.done) return ok(res, fileJson(st.files.get(s.done)));
-        const n = st.maxBody ? s.parts.size : Math.ceil(s.size / st.chunk);
+        const stored = st.maxBody ? s.parts.size : null;
+        const n = stored != null ? Math.max(...s.parts.keys()) + 1 : Math.ceil(s.size / effChunk());
         for (let i = 0; i < n; i++) if (!s.parts.has(i)) return fail(res, 409, 'incomplete', 'missing part ' + i);
         const all = Buffer.concat([...Array(n).keys()].map((i) => s.parts.get(i)));
+        if (s.base) {
+          // Atomic replace: the file keeps its id (and name/path); the previous bytes are archived as a version.
+          const base = st.files.get(s.base.id);
+          if (base) {
+            base.versions = base.versions || [];
+            base.versions.push({ version: base.versions.length + 1, bytes: base.bytes });
+            base.bytes = all; base.lastModified = tick();
+            st.chunkStore.set(sha(all.slice(0, effChunk())), all.slice(0, effChunk()));
+            s.done = base.id; note('revision', base.id);
+            return ok(res, { id: base.id, revision: true, committed: true, version: base.versions.length + 1, ...fileJson(base) });
+          }
+        }
         const r = createFile(s.name, s.path, all, s.lastModified);
         if (r.err) return fail(res, ...r.err);
         s.done = r.f.id; note('upload', r.f.id); return ok(res, fileJson(r.f));

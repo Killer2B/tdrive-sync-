@@ -1,7 +1,7 @@
 {
   "id": "tdrive-sync",
   "name": "Tdrive Sync",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "minAppVersion": "1.5.0",
   "description": "Two-way sync of your vault (notes and attachments) with your personal Tdrive host over its REST API.",
   "author": "Tdrive",
