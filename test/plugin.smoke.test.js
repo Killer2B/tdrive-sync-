@@ -77,6 +77,33 @@ test('built main.js loads, registers commands, tests connection, syncs both ways
     const rep2 = await plugin.runSync({ mode: 'download-only' });
     assert.equal(rep2.downloaded, 1); assert.equal(fa.files.get('remote.md').tfile.data.toString(), 'R');
 
+    // ---- notification styles: default is technical, the choice persists, and it changes the notice text ----
+    assert.equal(plugin.settings.notifyStyle, 'technical', 'default notification style');
+    notices.length = 0;
+    plugin.settings.notifyStyle = 'elegant';
+    await plugin.saveSettings();
+    assert.equal(plugin.data.notifyStyle, 'elegant', 'style saved');
+    fa.put('styled.md', 'S');
+    await plugin.runSync();
+    const styled = notices[notices.length - 1];
+    assert.match(styled, /✅/, 'elegant completion notice uses the success icon');
+    assert.ok(styled.split('\n').length >= 2, 'elegant notice is two lines');
+
+    plugin.settings.notifyStyle = 'concise';
+    notices.length = 0;
+    fa.put('styled2.md', 'S2');
+    await plugin.runSync();
+    assert.match(notices[notices.length - 1], /✅/);
+    assert.equal(notices[notices.length - 1].split('\n').length, 1, 'concise notice is one line');
+
+    // technical output must stay identical to the original format
+    plugin.settings.notifyStyle = 'technical';
+    notices.length = 0;
+    fa.put('styled3.md', 'S3');
+    await plugin.runSync();
+    assert.match(notices[notices.length - 1], /^Tdrive: /);
+    assert.match(notices[notices.length - 1], /↑1 ↓0 ⇄0 =0 ⚠0 ✗0|↑\d+ ↓\d+ ⇄\d+ =\d+ ⚠\d+ ✗\d+/);
+
     await plugin.pause(); assert.equal(await plugin.runSync(), null);   // paused -> nothing runs
     await plugin.resume();
     plugin.probeApi && await plugin.probeApi();

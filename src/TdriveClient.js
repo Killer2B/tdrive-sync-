@@ -83,6 +83,7 @@ class TdriveClient {
       } catch (e) {
         const err = new TdriveError('Network error: ' + this.redact(e && e.message), { isNetwork: true, retryable: true });
         if (attempt >= this.maxRetries) throw err;
+        if (this.onRetry) { try { this.onRetry({ attempt: attempt + 1, status: 0, network: true }); } catch (_) { /* never break on a hook */ } }
         await this._wait(attempt, null);
         continue;
       }
@@ -94,6 +95,7 @@ class TdriveClient {
         }
         const err = this._httpError(res);
         if (attempt >= this.maxRetries) throw err;
+        if (this.onRetry) { try { this.onRetry({ attempt: attempt + 1, status: res.status, retryAfter: err.retryAfter }); } catch (_) { /* hook only */ } }
         await this._wait(attempt, err.retryAfter);
         continue;
       }
