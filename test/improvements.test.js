@@ -166,7 +166,8 @@ test('a fresh lock from another device blocks the run', async () => {
     env.local.put('seed.md', 'x');
     const r1 = await env.engine.syncNow();
     assert.equal(r1.status, 'ok', JSON.stringify(r1));
-    env.server.addFile('/Vault/', '.tdrive-sync.lock', JSON.stringify({ device: 'other-device', at: Date.now() }));
+    const lf = env.server.addFile('/Vault/', '.tdrive-sync.lock-other-device', '{}');
+    lf.lastModified = Date.now();
     env.local.put('new.md', 'y');
     const r = await env.engine.syncNow();
     assert.equal(r.status, 'locked', JSON.stringify(r));
@@ -179,7 +180,8 @@ test('a stale lock is taken over', async () => {
   try {
     env.local.put('seed.md', 'x');
     await env.engine.syncNow();
-    env.server.addFile('/Vault/', '.tdrive-sync.lock', JSON.stringify({ device: 'other-device', at: Date.now() - 3600_000 }));
+    const lf = env.server.addFile('/Vault/', '.tdrive-sync.lock-other-device', '{}');
+    lf.lastModified = Date.now() - 3600_000;
     env.local.put('new.md', 'y');
     const r = await env.engine.syncNow();
     assert.equal(r.status, 'ok', JSON.stringify(r));

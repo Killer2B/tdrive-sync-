@@ -2200,31 +2200,25 @@ class SyncEngine {
     const meta = this.manifest.data.meta;
     if (!meta.deviceId) meta.deviceId = randomUuid();
     const root = folderPathFor(s.remoteFolder, '');
-    const lockName = '.tdrive-sync.lock';
     const mine = meta.deviceId;
+    const prefix = '.tdrive-sync.lock';              // a small hidden marker file, named "...-<deviceId>"
     const ttlMs = (Number.isFinite(s.remoteLockMinutes) ? s.remoteLockMinutes : 15) * 60000;
+    const now = this.now();
     try {
       const listing = await this.client.listFolder(root);
-      const found = listing.files.find((f) => f.name === lockName);
-      if (found) {
-        let info = null;
-        try {
-          const res = await this.client.request({ path: '/files/' + encodeURIComponent(found.id) + '/content', binary: true });
-          info = JSON.parse(new TextDecoder().decode(res.body));
-        } catch (e) { /* unreadable lock: treat as stale */ }
-        const fresh = info && (this.now() - (info.at || 0)) < ttlMs;
-        if (fresh && info.device && info.device !== mine && !info.force) return { blocked: true, by: info.device, at: info.at };
-        if (fresh && info.device === mine) {
-          // Our own fresh lock: reuse it (no write). Only refresh after 5 minutes so a no-op sync writes nothing.
-          if ((this.now() - (info.at || 0)) < 5 * 60000) return { id: found.id, reused: true };
-          try { await this.client.trash(found.id); } catch (e) { /* rewrite below */ }
-        } else {
-          try { await this.client.trash(found.id); } catch (e) { /* stale: overwrite below */ }
-        }
+      const locks = (listing.files || []).filter((f) => f && typeof f.name === 'string' && f.name.startsWith(prefix));
+      for (const f of locks) {
+        const isMine = f.name === prefix + '-' + mine;
+        // The listing carries a timestamp; no need to download (large response bodies can be encoded oddly).
+        const age = Number.isFinite(f.mtime) ? (now - f.mtime) : 0;
+        const fresh = !Number.isFinite(f.mtime) || age < ttlMs;
+        if (isMine && fresh) return { id: f.id, reused: true };
+        if (!isMine && fresh) return { blocked: true, by: String(f.name).slice(prefix.length + 1) || 'another device', at: f.mtime };
+        try { await this.client.trash(f.id); } catch (e) { /* stale marker: drop it */ }
       }
-      const body = new TextEncoder().encode(JSON.stringify({ device: mine, at: this.now(), platform: safePlatform() })).buffer;
+      const body = new TextEncoder().encode(JSON.stringify({ device: mine, at: now, platform: safePlatform() })).buffer;
       const up = await this.client.request({
-        method: 'POST', path: '/files', query: { name: lockName, path: root },
+        method: 'POST', path: '/files', query: { name: prefix + '-' + mine, path: root },
         headers: { 'Content-Type': 'application/octet-stream', 'Idempotency-Key': randomUuid() }, body,
       });
       const f = normalizeFileResponse(up);
