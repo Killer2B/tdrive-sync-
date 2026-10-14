@@ -134,6 +134,79 @@ test('engine: a stale larger remote size no longer fails the "compare" step with
   } finally { await env.stop(); }
 });
 
+test('off-by-one: first response short by one byte, tail read finishes it (33-byte file)', async () => {
+  const env = await makeEnv();
+  try {
+    const data = Buffer.alloc(33); for (let i = 0; i < 33; i++) data[i] = (i * 13 + 7) & 255;
+    env.server.addFile('/Vault/', 'tiny.md', data);
+    env.server.contentTruncate = { times: 1, at: 32 };      // returns 32 of 33 bytes on the first read
+    const file = await env.client.getFile(env.server.findLive('/Vault/', 'tiny.md').id);
+    const out = await downloadFile(env.client, file, { chunkBytes: 4 * 1024 * 1024 });
+    assert.equal(out.byteLength, 33);
+    assert.equal(shaHex(out), sha(data));
+  } finally { await env.stop(); }
+});
+
+test('a stale LISTING size larger than the object is resolved by the manifest checksum and converges', async () => {
+  const env = await makeEnv();
+  try {
+    const real = Buffer.alloc(941); for (let i = 0; i < 941; i++) real[i] = (i * 5 + 3) & 255;
+    const rec = env.server.addFile('/Vault/', 'note.md', real);
+    env.server.listingSizeOverride = { [rec.id]: 5348 };     // the listing lies: claims 5348, real is 941
+
+    // First run: downloads, verifies against the manifest (941), accepts and records the real size.
+    const r1 = await env.engine.syncNow();
+    assert.equal(r1.status, 'ok', JSON.stringify(r1));
+    assert.equal(r1.downloaded, 1, JSON.stringify(r1));
+    assert.equal(sha(env.local.files.get('note.md').data), sha(real), 'byte-for-byte correct');
+    assert.equal(env.engine.manifest.getFile('note.md').remoteSize, 941, 'the ledger converged to the real size');
+
+    // Second run: nothing to do (the size mismatch no longer repeats).
+    const r2 = await env.engine.syncNow();
+    assert.equal(r2.status, 'ok', JSON.stringify(r2));
+    assert.equal(r2.downloaded + r2.uploaded + r2.conflicts, 0, JSON.stringify(r2));
+  } finally { await env.stop(); }
+});
+
+test('a wrong object served for a file id is REJECTED by the manifest checksum, never accepted as content', async () => {
+  const env = await makeEnv();
+  try {
+    const real = make5348();
+    const rec = env.server.addFile('/Vault/', 'x.md', real);
+    const wrong = Buffer.alloc(941); wrong.fill(9);          // some other file's bytes
+    env.server.contentOverride = wrong;                       // content endpoint now serves the wrong object
+    const file = await env.client.getFile(rec.id);
+    const expect = (await env.client.request({ path: `/files/${rec.id}/chunks` })).chunks[0].checksum;
+    await assert.rejects(
+      downloadFile(env.client, file, { chunkBytes: 4 * 1024 * 1024, expectSha: expect, verifyLabel: 'x.md' }),
+      /checksum mismatch/i,
+    );
+    // And the engine reports an error rather than storing the wrong bytes.
+    env.local.files.delete('x.md');
+    const r = await env.engine.syncNow();
+    assert.ok(r.failures.length >= 1 || r.errors >= 1, 'reported, not silent: ' + JSON.stringify(r));
+    assert.equal(env.local.files.has('x.md'), false, 'the wrong object was never written locally');
+  } finally { await env.stop(); }
+});
+
+test('a stale LISTING size is adopted from the manifest BEFORE the transfer (no false failure)', async () => {
+  // Reproduces "compare ...: Incomplete download: 941/5348": the listing claimed a size the object does not have.
+  const env = await makeEnv();
+  try {
+    const real = Buffer.alloc(941); for (let i = 0; i < 941; i++) real[i] = (i * 7 + 1) & 255;
+    const rec = env.server.addFile('/Vault/', 'dup.md', real);
+    env.server.listingSizeOverride = { [rec.id]: 5348 };   // the listing lies (larger)
+    // Seed a local copy so the run takes the COMPARE branch (the one that used to error).
+    env.local.put('dup.md', real);
+    const r = await env.engine.syncNow();
+    assert.equal(r.status, 'ok', JSON.stringify(r));
+    assert.equal(r.errors, 0, 'no error: ' + JSON.stringify(r.failures));
+    assert.equal(sha(env.local.files.get('dup.md').data), sha(real), 'local content unchanged and correct');
+    const entry = env.engine.manifest.getFile('dup.md');
+    assert.equal(entry.remoteSize, 941, 'the ledger adopted the server size');
+  } finally { await env.stop(); }
+});
+
 test('atomic replace: a failed download leaves the existing local file intact', async () => {
   const env = await makeEnv();
   try {

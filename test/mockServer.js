@@ -21,7 +21,7 @@ function createMockServer(opts = {}) {
   const tick = () => (st.clock += 1000);
   // The part size a session actually enforces: the advertised chunk, capped by any hard request-body limit.
   const effChunk = () => (st.maxBody ? Math.min(st.chunk, st.maxBody) : st.chunk);
-  const fileJson = (f) => ({ id: f.id, name: f.name, path: f.path, size: f.bytes.length, lastModified: f.lastModified, trashed: f.trashed });
+  const fileJson = (f) => ({ id: f.id, name: f.name, path: f.path, size: (st.listingSizeOverride && st.listingSizeOverride[f.id] != null) ? st.listingSizeOverride[f.id] : f.bytes.length, lastModified: f.lastModified, trashed: f.trashed });
   const live = () => [...st.files.values()].filter((f) => !f.trashed);
   // Activity recorded by requests during a sync must look OLDER than the engine's snapshot stamp; activity
   // simulating another device (the helpers below) must look NEWER. The fake clock is far in the past.
@@ -191,6 +191,15 @@ function createMockServer(opts = {}) {
         const etag = etagOf(f);
         if (req.headers['if-none-match'] === etag) return send(res, 304, '', { ETag: etag });
         if (st.busyFirst && st.busyFirst > 0) { st.busyFirst--; return fail(res, 503, 'Busy', 'try later'); }
+        // Serve a DIFFERENT (wrong) object for the content, while /chunks still describes the real file.
+        if (st.contentOverride) {
+          const w = st.contentOverride;
+          const rg0 = /bytes=(\d+)-(\d*)/.exec(req.headers.range || '');
+          if (!rg0) return send(res, 200, w, { ETag: etag });
+          const a0 = Number(rg0[1]); const b0 = Math.min(rg0[2] ? Number(rg0[2]) : w.length - 1, w.length - 1);
+          if (a0 >= w.length) return send(res, 416, '', { 'Content-Range': `bytes */${w.length}`, ETag: etag });
+          return send(res, 206, w.subarray(a0, b0 + 1), { 'Content-Range': `bytes ${a0}-${b0}/${w.length}`, ETag: etag });
+        }
         const rg = /bytes=(\d+)-(\d*)/.exec(req.headers.range || '');
         if (!rg) return send(res, 200, f.bytes, { ETag: etag });
         const a = Number(rg[1]); const b = Math.min(rg[2] ? Number(rg[2]) : f.bytes.length - 1, f.bytes.length - 1);

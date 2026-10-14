@@ -90,6 +90,7 @@ class SyncEngine {
     return {
       etag: m.etag, version: m.version, chunker: normalizeChunker(m.chunker) || null, plan: raw,
       sizes: raw.map((c) => c.size), hashes: raw.map((c) => c.checksum),
+      size: Number.isFinite(m.size) ? m.size : raw.reduce((n, c) => n + (c.size || 0), 0),   // authoritative total
     };
   }
 
@@ -151,6 +152,20 @@ class SyncEngine {
     if (!map || map.notModified || map.tooMany || !map.hashes || map.hashes.length !== 1) return { sha: null, map: null };
     if (map.sizes && map.sizes.length === 1 && map.sizes[0] !== remote.size) return { sha: null, map: null };
     return { sha: map.hashes[0], map };
+  }
+
+  /** The manifest is the server's authoritative description of the stored object. If the listing/metadata size
+   *  disagrees with it (stale listing, duplicate-name collision), adopt the manifest size before transferring so
+   *  a wrong advertised size can never trigger a past-EOF range or a false "Incomplete download". */
+  async _adoptManifestSize(remote) {
+    if (!this.manifestFn) return;
+    try {
+      const map = await this._fetchChunkMap(remote, null);
+      if (map && !map.notModified && !map.tooMany && Number.isFinite(map.size) && map.size !== remote.size) {
+        this.log('warn', `Size mismatch for ${remote.name || remote.id}: listing ${remote.size}, server ${map.size} — using the server value.`);
+        try { remote.size = map.size; } catch (e) { /* frozen entry */ }
+      }
+    } catch (e) { /* manifest is optional */ }
   }
 
   /** Downloads a file, verifying integrity where possible and retrying transient/incomplete transfers with a
@@ -781,6 +796,8 @@ class SyncEngine {
         }
         // Incremental pull first: when we hold a chunk map for the old content, fetch only the changed byte
         // ranges. Falls through to a normal (full) download whenever a delta is not applicable.
+        // Adopt the server's authoritative size first so a stale listing cannot cause a false failure.
+        await this._adoptManifestSize(R);
         const delta = (L && E && R.size >= DELTA_MIN_BYTES) ? await this._deltaPull(key, R, E, onP) : null;
         if (delta && delta.unchanged) { if (delta.map) this._storeMap(key, delta.map, R); rep.skipped++; break; }
         let data;
@@ -806,7 +823,11 @@ class SyncEngine {
       case 'compare': {
         const ldata = await this.local.readBinary(key); const lhash = await sha256Hex(ldata);
         const lstat = await this.local.stat(key);
-        const rdata = await this.downloadFn(this.client, R, { ...this._downOpts(), onProgress: onP });
+        // Verify the remote content against the server's own manifest checksum before comparing, so a wrong or
+        // short body (mis-sized listing, duplicate-name collision) can never be treated as the file's content.
+        const expect = await this._expectedSha(R);
+        if (expect.map) this._storeMap(key, expect.map, R);
+        const rdata = await this._downloadVerified(key, R, onP, expect.sha);
         if ((await sha256Hex(rdata)) === lhash) { this._record(key, { lhash, lstat, remote: R }); rep.skipped++; }
         else { await this.conflicts.record(key, R, rdata); rep.conflicts++; }
         break;

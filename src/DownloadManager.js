@@ -95,19 +95,20 @@ async function downloadSequential(client, file, chunkBytes, onProgress, opts = {
   // Whenever we appear short of the advertised size, fetch the tail from the exact offset. The tail read is the
   // arbiter: if more bytes exist we get them (recovering a truncated/under-reported stream); if the object really
   // is shorter, the server answers 416 with "bytes */<realTotal>" and readFrom reports that authoritative total.
+  let total = r.total != null ? r.total : advertised;
   if (advertised != null && buf.byteLength < advertised) {
     const tail = await readFrom(client, file.id, buf.byteLength, advertised, chunkBytes, onProgress);
     if (tail.buf.byteLength > 0) buf = concatBuffers([buf, tail.buf]);
-    const total = tail.total != null ? tail.total : advertised;
-    if (buf.byteLength !== total) throw new TdriveError(`Incomplete download: ${buf.byteLength}/${total} bytes`, { retryable: true });
-    if (file && file.size !== total) { try { file.size = total; } catch (e) { /* frozen entry */ } }
-    return buf;
+    if (tail.total != null) total = tail.total;
   }
-  const total = r.total != null ? r.total : advertised;
   if (total != null && buf.byteLength !== total) {
-    throw new TdriveError(`Incomplete download: ${buf.byteLength}/${total} bytes`, { retryable: true });
+    // The size is inconsistent. If the caller can verify integrity against the server's own checksum, let the
+    // bytes through and let verification decide (a wrong object fails loudly there); otherwise the size is all
+    // we have and a shortfall is a real, retryable error.
+    if (!opts.expectSha) throw new TdriveError(`Incomplete download: ${buf.byteLength}/${total} bytes`, { retryable: true });
+  } else if (total != null && file && file.size !== total) {
+    try { file.size = total; } catch (e) { /* frozen entry */ }     // converge a stale advertised size
   }
-  if (total != null && file && file.size !== total) { try { file.size = total; } catch (e) { /* frozen entry */ } }
   return buf;
 }
 
@@ -225,7 +226,11 @@ async function downloadFile(client, file, opts = {}) {
   } else buf = await downloadSequential(client, file, chunkBytes, opts.onProgress, opts);
   // Verify integrity of the RAW stored bytes: the manifest checksum describes exactly what is on the server,
   // i.e. the bytes BEFORE decryption/decompression (our container/encryption wraps the stored object).
-  if (opts.expectSha) await verifySha(buf, opts.expectSha, opts.verifyLabel);
+  if (opts.expectSha) {
+    await verifySha(buf, opts.expectSha, opts.verifyLabel);
+    // The checksum is authoritative: if the real length differs from the advertised size, adopt the real one.
+    if (file && file.size !== buf.byteLength) { try { file.size = buf.byteLength; } catch (e) { /* frozen entry */ } }
+  }
   if (opts.crypto) buf = await opts.crypto.decrypt(buf);       // decrypt first, then inflate
   if (opts.compressor) buf = await opts.compressor.decompress(buf);
   return buf;
