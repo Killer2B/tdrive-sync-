@@ -115,7 +115,7 @@ async function downloadSequential(client, file, chunkBytes, onProgress, opts = {
 async function verifySha(buf, expectSha, label) {
   const got = await sha256hex(new Uint8Array(buf));
   if (String(got).toLowerCase() !== String(expectSha).toLowerCase()) {
-    throw new Error(`Download checksum mismatch${label ? ' for ' + label : ''}: ${String(got).slice(0, 16)}… != expected ${String(expectSha).slice(0, 16)}…`);
+    throw new Error(`Download checksum mismatch${label ? ' for ' + label : ''}: got ${got} (${buf.byteLength} bytes) != expected ${expectSha}`);
   }
 }
 
@@ -207,8 +207,25 @@ async function downloadToSink(client, file, chunkBytes, onProgress, sink) {
   return { streamed: true, size: offset };
 }
 
+async function downloadWhole(client, file, opts) {
+  const res = await client.request({
+    path: '/files/' + encodeURIComponent(file.id) + '/content',
+    binary: true,
+  });
+  if (res.status !== 200) {
+    throw new TdriveError('Unexpected full download status ' + res.status, { status: res.status, retryable: res.status >= 500 || res.status === 429 });
+  }
+  let buf = res.body;
+  if (opts.expectSha) await verifySha(buf, opts.expectSha, `${opts.verifyLabel || ''} (full response)`);
+  if (file && file.size !== buf.byteLength) { try { file.size = buf.byteLength; } catch (e) { /* frozen entry */ } }
+  if (opts.crypto) buf = await opts.crypto.decrypt(buf);
+  if (opts.compressor) buf = await opts.compressor.decompress(buf);
+  return buf;
+}
+
 async function downloadFile(client, file, opts = {}) {
   const chunkBytes = opts.chunkBytes || 4 * 1024 * 1024;
+  if (opts.forceFull) return downloadWhole(client, file, opts);
   const hint = Number.isFinite(client._concurrencyHint) ? client._concurrencyHint : Infinity;
   const concurrency = clamp(Math.min(opts.concurrency || 1, hint), 1, MAX_CONCURRENCY);
   const known = Number.isFinite(file.size) ? file.size : null;
@@ -227,7 +244,7 @@ async function downloadFile(client, file, opts = {}) {
   // Verify integrity of the RAW stored bytes: the manifest checksum describes exactly what is on the server,
   // i.e. the bytes BEFORE decryption/decompression (our container/encryption wraps the stored object).
   if (opts.expectSha) {
-    await verifySha(buf, opts.expectSha, opts.verifyLabel);
+    await verifySha(buf, opts.expectSha, `${opts.verifyLabel || ''} (ranged response)`);
     // The checksum is authoritative: if the real length differs from the advertised size, adopt the real one.
     if (file && file.size !== buf.byteLength) { try { file.size = buf.byteLength; } catch (e) { /* frozen entry */ } }
   }

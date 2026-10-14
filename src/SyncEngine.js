@@ -172,14 +172,18 @@ class SyncEngine {
    *  FRESH remote entry (the listing may have been stale). Never returns unverified short data. */
   async _downloadVerified(key, remote, onProgress, expectSha) {
     let lastErr = null;
+    let forceFull = false;
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
-        return await this.downloadFn(this.client, remote, { ...this._downOpts(), onProgress, expectSha: expectSha || undefined, verifyLabel: key });
+        return await this.downloadFn(this.client, remote, { ...this._downOpts(), onProgress, expectSha: expectSha || undefined, verifyLabel: `${key} [id=${remote.id}]`, forceFull });
       } catch (e) {
         lastErr = e;
         const retryable = e && (e.retryable === true || e.status >= 500 || e.status === 429);
-        if (!retryable || attempt === 2) break;
-        // Re-read the authoritative size (and a fresh manifest hash) before retrying the tail.
+        const checksumMismatch = /checksum mismatch/i.test(String(e && e.message));
+        if ((!retryable && !checksumMismatch) || attempt === 2) break;
+        if (checksumMismatch) forceFull = true;
+        // Re-read the authoritative size and manifest hash before retrying; content may have changed
+        // between the manifest request and the download.
         try {
           const fresh = await this.client.getFile(remote.id);
           if (fresh) { if (Number.isFinite(fresh.size)) remote.size = fresh.size; if (fresh.mtime) remote.mtime = fresh.mtime; }

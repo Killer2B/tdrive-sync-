@@ -77,6 +77,35 @@ test('integrity: a same-length but corrupted response is rejected (checksum), no
   } finally { await env.stop(); }
 });
 
+test('engine: retries a ranged checksum mismatch with a verified full response', async () => {
+  const env = await makeEnv();
+  try {
+    const data = make5348();
+    const rec = env.server.addFile('/Vault/', 'range-cache.md', data);
+    const expected = sha(data);
+    const request = env.client.request.bind(env.client);
+    let ranged = 0;
+    let whole = 0;
+    env.client.request = async (opts) => {
+      const res = await request(opts);
+      if (opts.path.endsWith('/content') && opts.headers && opts.headers.Range) {
+        ranged++;
+        const body = new Uint8Array(res.body.slice(0));
+        body[0] ^= 0xff;
+        return { ...res, body: body.buffer };
+      }
+      if (opts.path.endsWith('/content')) whole++;
+      return res;
+    };
+
+    const file = await env.client.getFile(rec.id);
+    const out = await env.engine._downloadVerified('range-cache.md', file, null, expected);
+    assert.equal(sha(Buffer.from(out)), expected, 'the full response is checksum verified');
+    assert.ok(ranged >= 1, 'the ranged path was tried first');
+    assert.ok(whole >= 1, 'checksum mismatch triggered an un-ranged retry');
+  } finally { await env.stop(); }
+});
+
 test('engine: a short/corrupt remote never leaves a truncated local file, and reports an error', async () => {
   const env = await makeEnv();
   try {
@@ -87,6 +116,29 @@ test('engine: a short/corrupt remote never leaves a truncated local file, and re
     assert.equal(r.downloaded, 0, JSON.stringify(r));
     assert.ok(r.errors >= 1 || r.failures.length >= 1, 'an error is reported, not silent acceptance');
     assert.equal(env.local.files.has('corrupt.md'), false, 'no corrupt/partial file was written locally');
+  } finally { await env.stop(); }
+});
+
+test('engine: refreshes the manifest and retries if the remote changes during download', async () => {
+  const env = await makeEnv();
+  try {
+    const before = make5348();
+    const after = Buffer.from(before); after[0] ^= 0xff;
+    const rec = env.server.addFile('/Vault/', 'race.md', before);
+    const originalDownload = downloadFile;
+    let changed = false;
+    env.engine.downloadFn = async (client, file, opts) => {
+      if (!changed) {
+        changed = true;
+        env.server.modifyFile(rec.id, after);
+      }
+      return originalDownload(client, file, opts);
+    };
+
+    const r = await env.engine.syncNow();
+    assert.equal(r.status, 'ok', JSON.stringify(r));
+    assert.equal(r.downloaded, 1, JSON.stringify(r));
+    assert.equal(sha(env.local.files.get('race.md').data), sha(after), 'the retry fetched the current remote content');
   } finally { await env.stop(); }
 });
 

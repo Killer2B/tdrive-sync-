@@ -201,7 +201,14 @@ function createMockServer(opts = {}) {
           return send(res, 206, w.subarray(a0, b0 + 1), { 'Content-Range': `bytes ${a0}-${b0}/${w.length}`, ETag: etag });
         }
         const rg = /bytes=(\d+)-(\d*)/.exec(req.headers.range || '');
-        if (!rg) return send(res, 200, f.bytes, { ETag: etag });
+        if (!rg) {
+          if (st.corruptContent) {
+            const body = Buffer.from(f.bytes);
+            if (body.length) body[0] ^= 0xff;
+            return send(res, 200, body, { ETag: etag });
+          }
+          return send(res, 200, f.bytes, { ETag: etag });
+        }
         const a = Number(rg[1]); const b = Math.min(rg[2] ? Number(rg[2]) : f.bytes.length - 1, f.bytes.length - 1);
         if (a >= f.bytes.length) {
           // RFC 7233: range past EOF -> 416 with the authoritative total, no body.
