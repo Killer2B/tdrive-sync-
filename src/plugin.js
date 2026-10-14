@@ -155,6 +155,32 @@ class ObsidianLocalFS {
     }
     if (!(await this.ad.exists(p))) throw new Error(this.t('local.notAppeared', { path: p }));
   }
+  /** Atomically replaces a file's content: write a temp sibling, then rename it over the target so a reader
+   *  never sees a half-written file. Falls back to a direct (single-call) write when the adapter cannot rename.
+   *  The bytes are already integrity-verified by the engine before this is called. */
+  async writeBinaryAtomic(p, buf, mtime) {
+    const opts = mtime ? { mtime } : undefined;
+    const tmp = p + '.tdrive-part';
+    try {
+      await this._mkdirs(p);
+      await this.ad.writeBinary(tmp, buf, opts);
+      if (typeof this.ad.rename === 'function') {
+        try { await this.ad.rename(tmp, p); }
+        catch (e) { try { await this.ad.remove(p); } catch (_) { /* may not exist */ } await this.ad.rename(tmp, p); }
+        if (await this.ad.exists(tmp)) { try { await this.ad.remove(tmp); } catch (_) { /* leftover cleanup */ } }
+        if (await this.ad.exists(p)) {
+          // Make sure Obsidian's index knows the final content (adapter writes bypass the index).
+          const f = this.app.vault.getAbstractFileByPath(p);
+          if (f instanceof TFile && this.app.vault.modifyBinary) { try { await this.app.vault.modifyBinary(f, buf, opts); } catch (_) { /* index-only refresh */ } }
+          return;
+        }
+      } else {
+        await this.ad.remove(tmp);
+      }
+    } catch (e) { /* fall through to the plain write */ }
+    await this.writeBinary(p, buf, mtime);
+  }
+
   /** Folder paths known to the vault (null when the API is unavailable, so the engine skips folder deletion). */
   async listFolders() {
     const all = this.app.vault.getAllLoadedFiles;

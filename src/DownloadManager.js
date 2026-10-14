@@ -1,8 +1,10 @@
 'use strict';
-const { concatBuffers, pool, clamp } = require('./util');
+const { concatBuffers, pool, clamp, sleep } = require('./util');
 const { sha256hex } = require('./Chunker');
 
 const MAX_CONCURRENCY = 6;
+const MAX_STALLS = 6;          // consecutive no-progress responses before we stop and reconcile
+const MAX_REQUESTS = 100000;   // absolute safety bound (a normal multi-part download is never capped)
 
 /** One HTTP Range request for a byte slice of a file. */
 function rangeRequest(client, id, from, to) {
@@ -12,59 +14,125 @@ function rangeRequest(client, id, from, to) {
   });
 }
 
+/** The authoritative current size from the file metadata (used when a listing/size looks stale). */
+async function serverSize(client, id) {
+  try { const f = await client.getFile(id); return f && Number.isFinite(f.size) ? f.size : null; }
+  catch (e) { return null; }
+}
+
+const totalFromHeaders = (headers) => {
+  const m = /bytes\s+(\d+)-(\d+)\/(\d+|\*)/i.exec((headers && headers['content-range']) || '');
+  if (m && m[3] !== '*') return Number(m[3]);
+  const cl = Number(headers && headers['content-length']);
+  return Number.isFinite(cl) && cl > 0 ? cl : null;
+};
+
+/**
+ * Downloads [from, total) as a sequence of ranged requests, starting each request where the previous body
+ * actually ended (so a truncated response is continued, not restarted). Returns { buf, total, got }.
+ * A 200 answer (server ignored Range) is accepted as the whole body. Byte counting uses the *received*
+ * length plus the server's own Content-Range/Content-Length total — never a guess.
+ */
+async function readFrom(client, id, from, expectedTotal, chunkBytes, onProgress) {
+  const chunks = [];
+  let offset = from;
+  let total = Number.isFinite(expectedTotal) ? expectedTotal : null;
+  let stalls = 0;                    // consecutive responses that made no progress
+  let guard = 0;                     // absolute safety bound on requests
+  while (total === null || offset < total) {
+    if (++guard > MAX_REQUESTS) break;
+    const before = offset;
+    const res = await rangeRequest(client, id, offset, offset + chunkBytes - 1);
+    if (res.status === 200) {
+      // Server ignored Range and returned a whole body (possibly with a Content-Length we can trust).
+      const cl = Number(res.headers && res.headers['content-length']);
+      const whole = offset === 0 ? res.body : res.body.slice(offset);
+      if (whole.byteLength > 0) { chunks.push(whole); offset += whole.byteLength; }
+      const t = Number.isFinite(cl) && cl > 0 ? cl : offset;
+      total = t;
+    } else if (res.status === 206) {
+      const m = /bytes\s+(\d+)-(\d+)\/(\d+|\*)/i.exec((res.headers && res.headers['content-range']) || '');
+      if (m) {
+        if (Number(m[1]) !== offset) throw new Error(`Unexpected Content-Range start (asked ${offset}, got ${m[1]})`);
+        if (m[3] !== '*') total = Number(m[3]);
+      }
+      if (res.body.byteLength > 0) {
+        let body = res.body;
+        if (total !== null && offset + body.byteLength > total) body = body.slice(0, total - offset);   // never over-read
+        chunks.push(body); offset += body.byteLength;
+      }
+    } else {
+      throw new TdriveError('Unexpected download status ' + res.status, { status: res.status, retryable: res.status >= 500 || res.status === 429 });
+    }
+    if (onProgress) onProgress(offset, total || 0);
+    if (offset === before) { if (++stalls > MAX_STALLS) break; } else stalls = 0;
+  }
+  return { buf: concatBuffers(chunks), total, got: offset };
+}
+
+/**
+ * Sequential download that is resilient to short/truncated responses and to a stale listing:
+ *  1. read the whole object, continuing across truncated responses;
+ *  2. if the result is shorter than the advertised size, re-read the AUTHORITATIVE size (metadata) — a stale
+ *     listing must not fail a valid transfer (accept when the server confirms the shorter size);
+ *  3. otherwise fetch the missing tail from the exact offset and reassemble;
+ *  4. verify integrity (checksum) before returning; the caller writes only verified bytes.
+ */
+async function downloadSequential(client, file, chunkBytes, onProgress, opts = {}) {
+  const advertised = Number.isFinite(file.size) ? file.size : null;
+  let r = await readFrom(client, file.id, 0, advertised, chunkBytes, onProgress);
+  let buf = r.buf;
+  if (advertised != null && buf.byteLength !== advertised) {
+    const fresh = await serverSize(client, file.id);
+    if (fresh != null && fresh === buf.byteLength) return buf;              // stale listing -> the bytes are complete
+    const target = fresh != null ? fresh : advertised;
+    if (buf.byteLength < target) {
+      const tail = await readFrom(client, file.id, buf.byteLength, target, chunkBytes, onProgress);
+      buf = concatBuffers([buf, tail.buf]);
+    }
+    if (buf.byteLength !== target) throw new TdriveError(`Incomplete download: ${buf.byteLength}/${target} bytes`, { retryable: true });
+  }
+  return buf;
+}
+
+async function verifySha(buf, expectSha, label) {
+  const got = await sha256hex(new Uint8Array(buf));
+  if (String(got).toLowerCase() !== String(expectSha).toLowerCase()) {
+    throw new Error(`Download checksum mismatch${label ? ' for ' + label : ''}: ${String(got).slice(0, 16)}… != expected ${String(expectSha).slice(0, 16)}…`);
+  }
+}
+
+/** TdriveError is imported lazily to avoid a circular dependency at module load. */
+class TdriveError extends Error {
+  constructor(message, o = {}) { super(message); this.name = 'TdriveError'; Object.assign(this, o); }
+}
+
 /**
  * Reads the exact byte range [from, to] and returns it. Some servers answer a Range request with a SHORTER
  * body than asked (they may even echo the full Content-Range while truncating), so the range is re-requested
  * from where the body actually ended until it is complete. This is what makes parallel downloads safe.
  */
 async function readRange(client, id, from, to) {
-  const chunks = []; let cur = from;
+  const chunks = []; let cur = from; let stalls = 0;
   while (cur <= to) {
+    const before = cur;
     const res = await rangeRequest(client, id, cur, to);
     if (res.status === 200) {
       // Server ignored Range and returned the whole body.
       const whole = cur === 0 ? res.body : res.body.slice(cur);
-      if (whole.byteLength === 0) throw new Error('Empty download response');
-      chunks.push(whole); cur += whole.byteLength;
-      continue;
+      if (whole.byteLength > 0) { chunks.push(whole); cur += whole.byteLength; }
+    } else if (res.status === 206) {
+      const m = /bytes\s+(\d+)-(\d+)\/(\d+|\*)/i.exec(res.headers['content-range'] || '');
+      if (m && Number(m[1]) !== cur) throw new Error('Unexpected Content-Range start');
+      if (res.body.byteLength > 0) { chunks.push(res.body); cur += res.body.byteLength; }
+    } else {
+      throw new TdriveError('Unexpected download status ' + res.status, { status: res.status, retryable: res.status >= 500 || res.status === 429 });
     }
-    if (res.status !== 206) throw new Error('Unexpected download status ' + res.status);
-    const m = /bytes\s+(\d+)-(\d+)\/(\d+|\*)/i.exec(res.headers['content-range'] || '');
-    if (m && Number(m[1]) !== cur) throw new Error('Unexpected Content-Range start');
-    if (res.body.byteLength === 0) throw new Error('Empty download part');
-    chunks.push(res.body); cur += res.body.byteLength;
+    if (cur === before) { if (++stalls > MAX_STALLS) throw new TdriveError(`Incomplete range: ${cur - from}/${to - from + 1} bytes`, { retryable: true }); } else stalls = 0;
   }
   return concatBuffers(chunks);
 }
 
-/**
- * Sequential ranged download. Each chunk is its own request that resumes from the last received offset, so an
- * interrupted (or truncated) transfer recovers instead of restarting. Works even when the server ignores Range.
- */
-async function downloadSequential(client, file, chunkBytes, onProgress) {
-  const known = Number.isFinite(file.size) ? file.size : null;
-  const chunks = []; let offset = 0; let total = known;
-  while (total === null || offset < total) {
-    const res = await rangeRequest(client, file.id, offset, offset + chunkBytes - 1);
-    if (res.status === 206) {
-      const m = /bytes\s+(\d+)-(\d+)\/(\d+|\*)/i.exec(res.headers['content-range'] || '');
-      if (m) {
-        if (Number(m[1]) !== offset) throw new Error('Unexpected Content-Range start');
-        if (m[3] !== '*') total = Number(m[3]);
-      }
-      if (res.body.byteLength === 0) break;
-      chunks.push(res.body); offset += res.body.byteLength;
-      if (total === null && res.body.byteLength < chunkBytes) total = offset;
-    } else {
-      // Server ignored Range and returned the whole body.
-      const whole = offset === 0 ? res.body : res.body.slice(offset);
-      chunks.push(whole); offset += whole.byteLength; total = offset;
-    }
-    if (onProgress) onProgress(offset, total);
-  }
-  if (known !== null && offset !== known) throw new Error(`Incomplete download: ${offset}/${known} bytes`);
-  return concatBuffers(chunks);
-}
 
 /**
  * Parallel ranged download. The first chunk is read alone; the rest are fanned out. Every part is read with
@@ -90,25 +158,33 @@ async function downloadParallel(client, file, chunkBytes, concurrency, onProgres
 }
 
 /** Sequential ranged download written straight to `sink` (disk), so a huge file never sits in memory.
- *  Used only for plaintext downloads of a known size; the caller handles hashing/recording. */
+ *  Used only for plaintext downloads of a known size; the caller handles hashing/recording.
+ *  Resilient the same way as downloadSequential: continues across truncated responses and reconciles the
+ *  authoritative size before giving up, and never leaves a partial file silently accepted. */
 async function downloadToSink(client, file, chunkBytes, onProgress, sink) {
-  const known = file.size;
-  let offset = 0;
-  while (offset < known) {
+  const advertised = Number.isFinite(file.size) ? file.size : null;
+  const target = advertised != null ? advertised : (await serverSize(client, file.id));
+  if (!Number.isFinite(target)) throw new TdriveError('Cannot stream an unknown-size download', { retryable: true });
+  let offset = 0; let stalls = 0; let guard = 0;
+  while (offset < target) {
+    if (++guard > MAX_REQUESTS) break;
+    const before = offset;
     const res = await rangeRequest(client, file.id, offset, offset + chunkBytes - 1);
-    if (res.status === 206) {
+    if (res.status === 200) {
+      const whole = offset === 0 ? res.body : res.body.slice(offset);
+      if (whole.byteLength > 0) { await sink.write(whole); offset += whole.byteLength; }
+    } else if (res.status === 206) {
       const m = /bytes\s+(\d+)-(\d+)\//i.exec(res.headers['content-range'] || '');
       if (m && Number(m[1]) !== offset) throw new Error('Unexpected Content-Range start');
-      if (res.body.byteLength === 0) break;
-      await sink.write(res.body); offset += res.body.byteLength;
+      if (res.body.byteLength > 0) { await sink.write(res.body); offset += res.body.byteLength; }
     } else {
-      const whole = offset === 0 ? res.body : res.body.slice(offset);
-      await sink.write(whole); offset += whole.byteLength;
+      throw new TdriveError('Unexpected download status ' + res.status, { status: res.status, retryable: res.status >= 500 || res.status === 429 });
     }
-    if (onProgress) onProgress(offset, known);
+    if (onProgress) onProgress(offset, target);
+    if (offset === before) { if (++stalls > MAX_STALLS) break; } else stalls = 0;
   }
-  if (offset !== known) throw new Error(`Incomplete download: ${offset}/${known} bytes`);
-  if (onProgress) onProgress(known, known);
+  if (offset !== target) throw new TdriveError(`Incomplete download: ${offset}/${target} bytes`, { retryable: true });
+  if (onProgress) onProgress(target, target);
   return { streamed: true, size: offset };
 }
 
@@ -122,7 +198,10 @@ async function downloadFile(client, file, opts = {}) {
   let buf;
   if (known === 0) buf = new ArrayBuffer(0);
   else if (known !== null && known > chunkBytes && concurrency > 1) buf = await downloadParallel(client, file, chunkBytes, concurrency, opts.onProgress);
-  else buf = await downloadSequential(client, file, chunkBytes, opts.onProgress);
+  else buf = await downloadSequential(client, file, chunkBytes, opts.onProgress, opts);
+  // Verify integrity of the RAW stored bytes: the manifest checksum describes exactly what is on the server,
+  // i.e. the bytes BEFORE decryption/decompression (our container/encryption wraps the stored object).
+  if (opts.expectSha) await verifySha(buf, opts.expectSha, opts.verifyLabel);
   if (opts.crypto) buf = await opts.crypto.decrypt(buf);       // decrypt first, then inflate
   if (opts.compressor) buf = await opts.compressor.decompress(buf);
   return buf;
@@ -164,4 +243,4 @@ async function downloadChangedRanges(client, id, changedChunks, onProgress) {
   return parts;
 }
 
-module.exports = { downloadFile, downloadSequential, downloadParallel, readRange, downloadToSink, fetchManifest, downloadChangedRanges };
+module.exports = { downloadFile, downloadSequential, downloadParallel, readRange, readFrom, downloadToSink, fetchManifest, downloadChangedRanges, verifySha };

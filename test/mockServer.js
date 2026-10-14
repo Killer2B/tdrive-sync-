@@ -190,10 +190,29 @@ function createMockServer(opts = {}) {
         const f = st.files.get(mm[1]); if (!f) return fail(res, 404, 'not_found', 'nope');
         const etag = etagOf(f);
         if (req.headers['if-none-match'] === etag) return send(res, 304, '', { ETag: etag });
+        if (st.busyFirst && st.busyFirst > 0) { st.busyFirst--; return fail(res, 503, 'Busy', 'try later'); }
         const rg = /bytes=(\d+)-(\d*)/.exec(req.headers.range || '');
         if (!rg) return send(res, 200, f.bytes, { ETag: etag });
         const a = Number(rg[1]); const b = Math.min(rg[2] ? Number(rg[2]) : f.bytes.length - 1, f.bytes.length - 1);
         if (a >= f.bytes.length) return fail(res, 416, 'range', 'bad range');
+        // Simulated truncated stream: advertise the TRUE total but send fewer bytes (stream cut short).
+        if (st.contentTruncate && st.contentTruncate.times > 0) {
+          st.contentTruncate.times--;
+          const end = Math.min(a + st.contentTruncate.at - 1, b);
+          return send(res, 206, f.bytes.subarray(a, end + 1), { 'Content-Range': `bytes ${a}-${b}/${f.bytes.length}`, ETag: etag });
+        }
+        // Simulated stale object header: the first read claims a SMALLER total with a short body (the
+        // "941/5348" failure). Later ranges are served correctly, so a resilient client can fetch the tail.
+        if (st.staleContent && st.staleContent.partial != null && a === 0) {
+          const p = Math.min(st.staleContent.partial, f.bytes.length);
+          return send(res, 206, f.bytes.subarray(0, p), { 'Content-Range': `bytes 0-${p - 1}/${p}`, ETag: etag });
+        }
+        // Simulated corruption: correct length, wrong bytes (integrity check must catch it).
+        if (st.corruptContent) {
+          const body = Buffer.from(f.bytes.subarray(a, b + 1));
+          if (body.length) body[0] ^= 0xff;
+          return send(res, 206, body, { 'Content-Range': `bytes ${a}-${b}/${f.bytes.length}`, ETag: etag });
+        }
         return send(res, 206, f.bytes.subarray(a, b + 1), { 'Content-Range': `bytes ${a}-${b}/${f.bytes.length}`, ETag: etag });
       }
       if ((mm = /^\/files\/([^/]+)$/.exec(route))) {

@@ -1,5 +1,5 @@
 'use strict';
-const { sha256Hex, nfc, splitRel, splitPath, folderPathFor, makeExcluder, bytesToHuman, randomUuid } = require('./util');
+const { sha256Hex, nfc, splitRel, splitPath, folderPathFor, makeExcluder, bytesToHuman, randomUuid, sleep } = require('./util');
 const { remoteSig, normalizeFileResponse } = require('./normalize');
 const { ConflictManager } = require('./ConflictManager');
 const { uploadFile, uploadRevision } = require('./UploadManager');
@@ -103,14 +103,6 @@ class SyncEngine {
   }
 
   /** Ensures a chunk map exists for a remote file (used after a full download so the NEXT change is incremental). */
-  async _ensureMap(rel, remote) {
-    const entry = this.manifest.getFile(rel);
-    if (entry && entry.chunkMap && entry.remoteSize === remote.size) return entry.chunkMap;
-    if (!(remote.size >= DELTA_MIN_BYTES)) return null;
-    const map = await this._fetchChunkMap(remote, null);
-    if (map && !map.notModified) { this._storeMap(rel, map, remote); return map; }
-    return null;
-  }
 
   /** Tries to fetch only what changed. Returns {unchanged} | {buffer, map} | null (=> do a full download). */
   async _deltaPull(rel, remote, E, onProgress) {
@@ -139,6 +131,51 @@ class SyncEngine {
 
   pause() { this.stopRequested = true; }
   log(level, msg) { this.manifest.addLog(level, this.client.redact(msg)); }
+
+  /** Ensures a chunk map exists for a remote file (used after a full download so the NEXT change is incremental). */
+  async _ensureMap(rel, remote) {
+    const entry = this.manifest.getFile(rel);
+    if (entry && entry.chunkMap && entry.remoteSize === remote.size) return entry.chunkMap;
+    if (!(remote.size >= DELTA_MIN_BYTES)) return null;
+    const map = await this._fetchChunkMap(remote, null);
+    if (map && !map.notModified) { this._storeMap(rel, map, remote); return map; }
+    return null;
+  }
+
+  /** For a small, single-chunk file: the authoritative size + whole-file SHA-256 from the server manifest,
+   *  so a download can be verified byte-for-byte before it is written. Also returns the map for the ledger. */
+  async _expectedSha(remote) {
+    const lim = await this.client.limits();
+    if (!Number.isFinite(remote.size) || remote.size <= 0 || remote.size > lim.oneShotMaxBytes) return { sha: null, map: null };
+    const map = await this._fetchChunkMap(remote, null);
+    if (!map || map.notModified || map.tooMany || !map.hashes || map.hashes.length !== 1) return { sha: null, map: null };
+    if (map.sizes && map.sizes.length === 1 && map.sizes[0] !== remote.size) return { sha: null, map: null };
+    return { sha: map.hashes[0], map };
+  }
+
+  /** Downloads a file, verifying integrity where possible and retrying transient/incomplete transfers with a
+   *  FRESH remote entry (the listing may have been stale). Never returns unverified short data. */
+  async _downloadVerified(key, remote, onProgress, expectSha) {
+    let lastErr = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        return await this.downloadFn(this.client, remote, { ...this._downOpts(), onProgress, expectSha: expectSha || undefined, verifyLabel: key });
+      } catch (e) {
+        lastErr = e;
+        const retryable = e && (e.retryable === true || e.status >= 500 || e.status === 429);
+        if (!retryable || attempt === 2) break;
+        // Re-read the authoritative size (and a fresh manifest hash) before retrying the tail.
+        try {
+          const fresh = await this.client.getFile(remote.id);
+          if (fresh) { if (Number.isFinite(fresh.size)) remote.size = fresh.size; if (fresh.mtime) remote.mtime = fresh.mtime; }
+          const exp = await this._expectedSha(remote);
+          if (exp.sha) expectSha = exp.sha;
+        } catch (e2) { /* keep the old size */ }
+        await sleep(600 * (attempt + 1));
+      }
+    }
+    throw lastErr;
+  }
 
   // ---------- remote / local scanning ----------
   /** Selective sync: when settings.syncFolders lists folder prefixes, only those subtrees are synced on this
@@ -425,11 +462,12 @@ class SyncEngine {
       // File exists locally with no ledger entry: never overwrite without an explicit policy.
       if ((await sha256Hex(await this.local.readBinary(rel))) !== rhash) return { conflict: true, data };
     }
-    await this.local.writeBinary(rel, data, remote.mtime);
+    // Replace the local file only with fully-verified bytes, atomically when the adapter supports it.
+    if (typeof this.local.writeBinaryAtomic === 'function') await this.local.writeBinaryAtomic(rel, data, remote.mtime);
+    else await this.local.writeBinary(rel, data, remote.mtime);
     this._record(rel, { lhash: rhash, lstat: await this.local.stat(rel), remote, text: this._baseTextFor(data) });
     return { written: true };
   }
-
   // ---------- main entry ----------
   async syncNow(opts = {}) {
     const rep = emptyReport();
@@ -742,11 +780,21 @@ class SyncEngine {
         // ranges. Falls through to a normal (full) download whenever a delta is not applicable.
         const delta = (L && E && R.size >= DELTA_MIN_BYTES) ? await this._deltaPull(key, R, E, onP) : null;
         if (delta && delta.unchanged) { if (delta.map) this._storeMap(key, delta.map, R); rep.skipped++; break; }
-        const data = delta && delta.buffer ? delta.buffer : await this.downloadFn(this.client, R, { ...this._downOpts(), onProgress: onP });
+        let data;
+        let verifiedMap = delta && delta.map ? delta.map : null;
+        if (delta && delta.buffer) {
+          data = delta.buffer;
+        } else {
+          // Integrity: for a small single-chunk file, verify the downloaded bytes against the server's own
+          // manifest checksum before writing. The same manifest is then reused for the ledger (no extra request).
+          const expect = await this._expectedSha(R);
+          if (expect.map) verifiedMap = expect.map;
+          data = await this._downloadVerified(key, R, onP, expect.sha);
+        }
         const r = await this._writeDownloaded(key, R, data, L, E);
         if (r.conflict) { await this.conflicts.record(key, R, data); rep.conflicts++; }
         else {
-          if (delta && delta.map) this._storeMap(key, delta.map, R);
+          if (verifiedMap) this._storeMap(key, verifiedMap, R);
           else await this._ensureMap(key, R);                    // so the NEXT change can be incremental
           if (r.unchanged) rep.skipped++; else rep.downloaded++;
         }
