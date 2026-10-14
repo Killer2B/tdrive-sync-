@@ -194,7 +194,10 @@ function createMockServer(opts = {}) {
         const rg = /bytes=(\d+)-(\d*)/.exec(req.headers.range || '');
         if (!rg) return send(res, 200, f.bytes, { ETag: etag });
         const a = Number(rg[1]); const b = Math.min(rg[2] ? Number(rg[2]) : f.bytes.length - 1, f.bytes.length - 1);
-        if (a >= f.bytes.length) return fail(res, 416, 'range', 'bad range');
+        if (a >= f.bytes.length) {
+          // RFC 7233: range past EOF -> 416 with the authoritative total, no body.
+          return send(res, 416, '', { 'Content-Range': `bytes */${f.bytes.length}`, ETag: etag });
+        }
         // Simulated truncated stream: advertise the TRUE total but send fewer bytes (stream cut short).
         if (st.contentTruncate && st.contentTruncate.times > 0) {
           st.contentTruncate.times--;

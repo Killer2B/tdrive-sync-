@@ -103,6 +103,37 @@ test('engine: the 941/5348 case now syncs successfully and the local copy matche
   } finally { await env.stop(); }
 });
 
+test('a stale LARGER metadata size (past-EOF range -> HTTP 416) is accepted, not treated as an error', async () => {
+  // Reproduces "compare <file>: HTTP 416": the listing/metadata claimed more bytes than the object stores,
+  // so the tail fetch hit a range past EOF. The 416 body-less reply with "bytes */<total>" is authoritative.
+  const env = await makeEnv();
+  try {
+    const data = make5348();
+    const rec = env.server.addFile('/Vault/', 'stale.md', data);
+    const file = await env.client.getFile(rec.id);
+    file.size = 9999;                       // simulate a stale/larger size from the listing
+    const out = await downloadFile(env.client, file, { chunkBytes: 4 * 1024 * 1024 });
+    assert.equal(out.byteLength, SIZE, 'accepted the real (shorter) object size');
+    assert.equal(shaHex(out), sha(data), 'byte-for-byte identical');
+    assert.equal(file.size, SIZE, 'the trusted size was corrected on the entry');
+  } finally { await env.stop(); }
+});
+
+test('engine: a stale larger remote size no longer fails the "compare" step with 416', async () => {
+  const env = await makeEnv();
+  try {
+    const data = make5348();
+    env.local.put('stale.md', data);                       // same content locally
+    const rec = env.server.addFile('/Vault/', 'stale.md', data);
+    rec.size = 9999;                                       // listing lies (larger) about the size
+    rec.lastModified = rec.lastModified + 1;               // make it look changed so a compare happens
+    const r = await env.engine.syncNow();
+    assert.equal(r.status, 'ok', JSON.stringify(r));
+    assert.ok(r.errors === 0, 'no 416 error: ' + JSON.stringify(r.failures));
+    assert.equal(sha(env.local.files.get('stale.md').data), sha(data), 'local file still correct');
+  } finally { await env.stop(); }
+});
+
 test('atomic replace: a failed download leaves the existing local file intact', async () => {
   const env = await makeEnv();
   try {

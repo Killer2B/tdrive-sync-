@@ -114,6 +114,10 @@ class TdriveClient {
         continue;
       }
       if (res.status === 304) return { status: 304, notModified: true, headers: res.headers || {}, body: new ArrayBuffer(0) };
+      // A ranged request past EOF answers 416 with "Content-Range: bytes */<total>" (RFC 7233). That total is
+      // authoritative, so binary callers must receive it (the download layer reconciles the size) rather than
+      // see it converted into an error.
+      if (res.status === 416 && binary) return { status: 416, headers: res.headers || {}, body: res.body || new ArrayBuffer(0) };
       if (res.status >= 400) throw this._httpError(res);
       if (binary) return { status: res.status, headers: res.headers || {}, body: res.body };
       let json;

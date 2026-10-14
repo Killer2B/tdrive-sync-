@@ -1,12 +1,12 @@
 {
   "name": "tdrive-sync",
-  "version": "1.7.2",
+  "version": "1.7.3",
   "description": "Obsidian plugin: two-way sync with Tdrive",
   "private": true,
   "scripts": {
     "build": "node scripts/build.js",
     "zip": "node scripts/build.js && node scripts/zip.js",
-    "test": "node --test test/client.test.js test/sync.test.js test/plugin.smoke.test.js test/folders.test.js test/localfs.test.js test/folder-delete.test.js test/folder-fixes.test.js test/perf.test.js test/improvements.test.js test/notify.test.js test/notice-render.test.js test/compression.test.js test/revision.test.js test/delta.test.js test/pro.test.js test/download-fix.test.js"
+    "test": "node --test test/client.test.js test/sync.test.js test/plugin.smoke.test.js test/folders.test.js test/localfs.test.js test/folder-delete.test.js test/folder-fixes.test.js test/perf.test.js test/improvements.test.js test/notify.test.js test/notice-render.test.js test/compression.test.js test/revision.test.js test/delta.test.js test/pro.test.js test/download-fix.test.js test/lock.test.js"
   },
   "license": "MIT"
 }

@@ -43,6 +43,13 @@ async function readFrom(client, id, from, expectedTotal, chunkBytes, onProgress)
     if (++guard > MAX_REQUESTS) break;
     const before = offset;
     const res = await rangeRequest(client, id, offset, offset + chunkBytes - 1);
+    if (res.status === 416) {
+      // RFC 7233: a range past EOF answers 416 with "Content-Range: bytes *\/<total>" and no body.
+      // That total is the AUTHORITATIVE size of what the server stores — we already hold all of it.
+      const n = /bytes\s+\*\/(\d+)/i.exec((res.headers && res.headers['content-range']) || '');
+      if (n) total = Number(n[1]);
+      break;
+    }
     if (res.status === 200) {
       // Server ignored Range and returned a whole body (possibly with a Content-Length we can trust).
       const cl = Number(res.headers && res.headers['content-length']);
@@ -67,31 +74,40 @@ async function readFrom(client, id, from, expectedTotal, chunkBytes, onProgress)
     if (onProgress) onProgress(offset, total || 0);
     if (offset === before) { if (++stalls > MAX_STALLS) break; } else stalls = 0;
   }
-  return { buf: concatBuffers(chunks), total, got: offset };
+  let buf = concatBuffers(chunks);
+  if (total !== null && from + buf.byteLength > total) buf = buf.slice(0, total - from);   // never over-read
+  return { buf, total, got: from + buf.byteLength };
 }
 
 /**
- * Sequential download that is resilient to short/truncated responses and to a stale listing:
- *  1. read the whole object, continuing across truncated responses;
- *  2. if the result is shorter than the advertised size, re-read the AUTHORITATIVE size (metadata) — a stale
- *     listing must not fail a valid transfer (accept when the server confirms the shorter size);
- *  3. otherwise fetch the missing tail from the exact offset and reassemble;
- *  4. verify integrity (checksum) before returning; the caller writes only verified bytes.
+ * Sequential download that is resilient to short/truncated responses, a stale advertised size AND a stale
+ * metadata size (the "941/5348" and "HTTP 416" families):
+ *  1. read the whole object; a 416 past EOF is treated as authoritative EOF, not an error;
+ *  2. if fewer bytes arrived than the advertised size, fetch ONLY the missing tail. The tail read itself
+ *     discovers the true total (206 Content-Range, or 416 "bytes *\/N") — so a metadata size that is larger
+ *     than the stored object can never produce a request past EOF, and the shorter object is accepted;
+ *  3. the trusted total is written back onto the remote entry so the ledger stays consistent.
  */
 async function downloadSequential(client, file, chunkBytes, onProgress, opts = {}) {
   const advertised = Number.isFinite(file.size) ? file.size : null;
   let r = await readFrom(client, file.id, 0, advertised, chunkBytes, onProgress);
   let buf = r.buf;
-  if (advertised != null && buf.byteLength !== advertised) {
-    const fresh = await serverSize(client, file.id);
-    if (fresh != null && fresh === buf.byteLength) return buf;              // stale listing -> the bytes are complete
-    const target = fresh != null ? fresh : advertised;
-    if (buf.byteLength < target) {
-      const tail = await readFrom(client, file.id, buf.byteLength, target, chunkBytes, onProgress);
-      buf = concatBuffers([buf, tail.buf]);
-    }
-    if (buf.byteLength !== target) throw new TdriveError(`Incomplete download: ${buf.byteLength}/${target} bytes`, { retryable: true });
+  // Whenever we appear short of the advertised size, fetch the tail from the exact offset. The tail read is the
+  // arbiter: if more bytes exist we get them (recovering a truncated/under-reported stream); if the object really
+  // is shorter, the server answers 416 with "bytes */<realTotal>" and readFrom reports that authoritative total.
+  if (advertised != null && buf.byteLength < advertised) {
+    const tail = await readFrom(client, file.id, buf.byteLength, advertised, chunkBytes, onProgress);
+    if (tail.buf.byteLength > 0) buf = concatBuffers([buf, tail.buf]);
+    const total = tail.total != null ? tail.total : advertised;
+    if (buf.byteLength !== total) throw new TdriveError(`Incomplete download: ${buf.byteLength}/${total} bytes`, { retryable: true });
+    if (file && file.size !== total) { try { file.size = total; } catch (e) { /* frozen entry */ } }
+    return buf;
   }
+  const total = r.total != null ? r.total : advertised;
+  if (total != null && buf.byteLength !== total) {
+    throw new TdriveError(`Incomplete download: ${buf.byteLength}/${total} bytes`, { retryable: true });
+  }
+  if (total != null && file && file.size !== total) { try { file.size = total; } catch (e) { /* frozen entry */ } }
   return buf;
 }
 
@@ -117,6 +133,7 @@ async function readRange(client, id, from, to) {
   while (cur <= to) {
     const before = cur;
     const res = await rangeRequest(client, id, cur, to);
+    if (res.status === 416) break;                 // past EOF: authoritative end of the object
     if (res.status === 200) {
       // Server ignored Range and returned the whole body.
       const whole = cur === 0 ? res.body : res.body.slice(cur);
@@ -170,6 +187,7 @@ async function downloadToSink(client, file, chunkBytes, onProgress, sink) {
     if (++guard > MAX_REQUESTS) break;
     const before = offset;
     const res = await rangeRequest(client, file.id, offset, offset + chunkBytes - 1);
+    if (res.status === 416) break;                       // past EOF: authoritative end
     if (res.status === 200) {
       const whole = offset === 0 ? res.body : res.body.slice(offset);
       if (whole.byteLength > 0) { await sink.write(whole); offset += whole.byteLength; }
@@ -197,8 +215,14 @@ async function downloadFile(client, file, opts = {}) {
   if (opts.sink && known !== null && known > 0 && !opts.crypto && !opts.compressor) return downloadToSink(client, file, chunkBytes, opts.onProgress, opts.sink);
   let buf;
   if (known === 0) buf = new ArrayBuffer(0);
-  else if (known !== null && known > chunkBytes && concurrency > 1) buf = await downloadParallel(client, file, chunkBytes, concurrency, opts.onProgress);
-  else buf = await downloadSequential(client, file, chunkBytes, opts.onProgress, opts);
+  else if (known !== null && known > chunkBytes && concurrency > 1) {
+    try { buf = await downloadParallel(client, file, chunkBytes, concurrency, opts.onProgress); }
+    catch (e) {
+      // A stale size can make a parallel part hit 416; fall back to the resilient sequential reader.
+      if (e && e.status === 416 || /Incomplete download|Unexpected download status/.test(String(e && e.message))) buf = await downloadSequential(client, file, chunkBytes, opts.onProgress, opts);
+      else throw e;
+    }
+  } else buf = await downloadSequential(client, file, chunkBytes, opts.onProgress, opts);
   // Verify integrity of the RAW stored bytes: the manifest checksum describes exactly what is on the server,
   // i.e. the bytes BEFORE decryption/decompression (our container/encryption wraps the stored object).
   if (opts.expectSha) await verifySha(buf, opts.expectSha, opts.verifyLabel);

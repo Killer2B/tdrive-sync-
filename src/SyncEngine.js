@@ -483,8 +483,11 @@ class SyncEngine {
       lock = await this._acquireLock();
       if (lock && lock.blocked) {
         rep.status = 'locked';
-        const msg = `Another device appears to be syncing (since ${new Date(lock.at || 0).toLocaleString()}). Try again later.`;
-        rep.warnings.push(msg); this.log('warn', msg);
+        // Report each distinct lock once; repeated attempts against the same lock stay quiet.
+        if (!lock.repeat) {
+          const msg = `Another device appears to be syncing (since ${new Date(lock.at || 0).toLocaleString()}). Try again later.`;
+          rep.warnings.push(msg); this.log('warn', msg);
+        }
         return rep;
       }
       const rootPath = folderPathFor(s.remoteFolder, '');
@@ -817,7 +820,15 @@ class SyncEngine {
   // ---------- remote lock ----------
   /** A tiny hidden file in the remote root. If another device is mid-sync (fresh lock, different device id),
    *  this run is skipped to avoid two devices racing. Best-effort: any error just means "no lock". The file is
-   *  dot-prefixed so the engine itself always ignores it. */
+   *  dot-prefixed so the engine itself always ignores it.
+   *
+   *  Robustness rules learned from a stuck-lock report:
+   *   - a lock is ALWAYS released at the end of the run (a leftover lock from a killed run is the main cause of
+   *     "Another device appears to be syncing" persisting), so we never leave orphans behind;
+   *   - a stale marker (older than the TTL) is dropped and taken over;
+   *   - a negative age (server clock ahead of ours) is clamped to 0 so clock skew cannot make an old lock look
+   *     fresh forever;
+   *   - the "another device" warning is emitted at most once per lock (not on every attempt). */
   async _acquireLock() {
     const s = this.getSettings();
     if (s.remoteLock === false) return null;
@@ -826,20 +837,26 @@ class SyncEngine {
     const root = folderPathFor(s.remoteFolder, '');
     const mine = meta.deviceId;
     const prefix = '.tdrive-sync.lock';              // a small hidden marker file, named "...-<deviceId>"
-    const ttlMs = (Number.isFinite(s.remoteLockMinutes) ? s.remoteLockMinutes : 15) * 60000;
+    const ttlMs = Math.max(1, Number.isFinite(s.remoteLockMinutes) ? s.remoteLockMinutes : 5) * 60000;
     const now = this.now();
     try {
       const listing = await this.client.listFolder(root);
       const locks = (listing.files || []).filter((f) => f && typeof f.name === 'string' && f.name.startsWith(prefix));
       for (const f of locks) {
         const isMine = f.name === prefix + '-' + mine;
-        // The listing carries a timestamp; no need to download (large response bodies can be encoded oddly).
-        const age = Number.isFinite(f.mtime) ? (now - f.mtime) : 0;
+        const age = Number.isFinite(f.mtime) ? Math.max(0, now - f.mtime) : 0;   // clamp clock skew
         const fresh = !Number.isFinite(f.mtime) || age < ttlMs;
-        if (isMine && fresh) return { id: f.id, reused: true };
-        if (!isMine && fresh) return { blocked: true, by: String(f.name).slice(prefix.length + 1) || 'another device', at: f.mtime };
+        if (isMine) { try { await this.client.trash(f.id); } catch (e) { /* replace our own marker */ } continue; }
+        if (fresh) {
+          // Remember that we already reported this exact lock, so repeated attempts stay quiet.
+          const stamp = `${f.name}@${f.mtime}`;
+          const seen = meta.lockWarned === stamp;
+          if (!seen) meta.lockWarned = stamp;
+          return { blocked: true, by: String(f.name).slice(prefix.length + 1) || 'another device', at: f.mtime, repeat: seen };
+        }
         try { await this.client.trash(f.id); } catch (e) { /* stale marker: drop it */ }
       }
+      meta.lockWarned = null;
       const body = new TextEncoder().encode(JSON.stringify({ device: mine, at: now, platform: safePlatform() })).buffer;
       const up = await this.client.request({
         method: 'POST', path: '/files', query: { name: prefix + '-' + mine, path: root },
@@ -850,10 +867,10 @@ class SyncEngine {
     } catch (e) { return null; }
   }
 
+  /** Always releases the marker we created (best effort), so a finished run never blocks the next device. */
   async _releaseLock(lock) {
-    // Reused locks are left in place so consecutive no-op syncs stay write-free; the TTL expires them.
-    if (!lock || !lock.id || lock.reused) return;
-    try { await this.client.trash(lock.id); } catch (e) { /* best effort */ }
+    if (!lock || !lock.id) return;
+    try { await this.client.trash(lock.id); } catch (e) { /* best effort; the TTL is the backstop */ }
   }
 
   /** Ledger says we synced this file, the recursive listing does not show it. Before believing it is gone
