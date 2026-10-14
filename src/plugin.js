@@ -704,7 +704,10 @@ class TdriveSyncPlugin extends Plugin {
     this.registerEvent(this.app.vault.on('modify', schedule));
     this.registerEvent(this.app.vault.on('create', schedule));
     this.registerEvent(this.app.vault.on('delete', schedule));
-    this.registerEvent(this.app.vault.on('rename', (f) => schedule(f)));
+    // A rename/move fires with the OLD path. Recording it makes the move explicit and deterministic, so the file
+    // can be moved in place on the server and then UPDATED (only changed parts) even if the user keeps editing it
+    // right after the move — instead of being re-created at the new path and leaving a stale duplicate behind.
+    this.registerEvent(this.app.vault.on('rename', (f, oldPath) => { this.rememberMove(oldPath, f && f.path); schedule(f); }));
     // Near-instant: catch up as soon as the app is focused again (covers edits made while backgrounded).
     if (typeof window !== 'undefined' && window.addEventListener) {
       const onFocus = () => { if (this.settings.instantSync && !this.settings.paused && this.settings.apiKey && !(this.engine && this.engine.running) && this.withinSchedule()) this.runSync({ silent: true, reason: 'focus' }); };
@@ -970,6 +973,27 @@ class TdriveSyncPlugin extends Plugin {
 
   async pause() { this.settings.paused = true; await this.saveSettings(); if (this.engine) this.engine.pause(); new Notice(this.t('notice.pausedDone')); this.notify(); }
   async resume() { this.settings.paused = false; await this.saveSettings(); new Notice(this.t('notice.resumedDone')); this.notify(); }
+
+  /** Records a rename/move seen by the editor: old path -> new path. Bounded and persisted (best effort).
+   *  The engine consumes these hints to perform an in-place move (same server file id) instead of a
+   *  create-new + delete-old, which is what previously left stale duplicates after "move then edit". */
+  rememberMove(oldPath, newPath) {
+    const from = String(oldPath || '').normalize('NFC');
+    const to = String(newPath || '').normalize('NFC');
+    if (!from || !to || from === to) return;
+    if (from.startsWith('.') || to.startsWith('.')) return;         // hidden files are never synced
+    try {
+      const meta = this.ledger.data.meta;
+      const hints = meta.moveHints || (meta.moveHints = {});
+      hints[from] = { to, at: Date.now() };
+      const keys = Object.keys(hints);
+      if (keys.length > 500) {                                       // keep the map tiny
+        keys.sort((a, b) => (hints[a].at || 0) - (hints[b].at || 0));
+        for (const k of keys.slice(0, keys.length - 500)) delete hints[k];
+      }
+      this.ledger.save().catch(() => { /* best effort */ });
+    } catch (e) { /* never break the editor on a bookkeeping failure */ }
+  }
 
   setupAutoSync() {
     if (this._timer) { window.clearInterval(this._timer); this._timer = null; }

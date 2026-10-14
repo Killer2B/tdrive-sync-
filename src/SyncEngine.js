@@ -556,27 +556,76 @@ class SyncEngine {
       if (rootMissing) this.log('info', 'Remote folder does not exist yet; it will be created on first upload.');
 
       // ---- rename/move detection ----
-      // A brand-new local file whose content equals a file we are about to delete remotely is the SAME file
-      // renamed/moved (e.g. by another device). Move it in place via PATCH instead of upload + trash: no bytes
-      // are transferred again. Only when deletions are allowed and this is a full two-way run.
+      // A moved/renamed file must be moved IN PLACE on the server (same file id, existing chunks reused) and then
+      // have its new content uploaded as a revision — never re-created at the new path while the old one lingers
+      // (that is what produced stale duplicates after "move the note, then keep editing it").
+      //
+      // Detection is layered, strongest evidence first:
+      //   1. an explicit hint captured from the editor's rename event (deterministic; works even with edits);
+      //   2. identical content hash (a move made while the app was closed);
+      //   3. same basename + an empty destination (a move+edit made while the app was closed).
       const pairs = []; const pairByUp = new Map(); const pairBySrc = new Map();
       const moveDone = new Set(); const moveFailed = new Set();
+      const consumedHints = [];
       if (!opts.only && mode === 'two-way' && s.deletionPolicy !== 'off' && !blockDeletes) {
+        const byKey = new Map(plan.map((p) => [p.key, p]));
+        const srcFor = (fromKey, upKey) => {
+          const src = byKey.get(fromKey);
+          return (src && src.action === 'deleteRemote' && src.R && !pairBySrc.has(src)) ? src : null;
+        };
+        const addPair = (up, src) => {
+          if (!up || !src || pairByUp.has(up) || pairBySrc.has(src)) return;
+          // Content changed when the new local hash differs from what we last synced for the source path.
+          const oldHash = src.E && src.E.localHash;
+          const contentChanged = !(oldHash && up.lhash === oldHash);
+          const pair = { up, src, contentChanged };
+          pairs.push(pair); pairByUp.set(up, pair); pairBySrc.set(src, pair);
+        };
+
+        // 1) explicit rename hints from the editor
+        const hints = this.manifest.data.meta.moveHints || {};
+        for (const [from, info] of Object.entries(hints)) {
+          const to = info && info.to;
+          const up = to && byKey.get(to);
+          if (!up || up.action !== 'upload') continue;
+          const src = srcFor(from, to);
+          if (!src) continue;
+          addPair(up, src); consumedHints.push(from);
+        }
+
+        // 2) identical content hash
         const byHash = new Map();
         for (const p of plan) {
-          if (p.action === 'deleteRemote' && p.E && p.E.localHash) {
+          if (p.action === 'deleteRemote' && p.E && p.E.localHash && !pairBySrc.has(p)) {
             if (!byHash.has(p.E.localHash)) byHash.set(p.E.localHash, []);
             byHash.get(p.E.localHash).push(p);
           }
         }
         for (const p of plan) {
-          if (p.action !== 'upload' || !p.lhash || !p.L) continue;
+          if (p.action !== 'upload' || !p.lhash || !p.L || pairByUp.has(p)) continue;
           const list = byHash.get(p.lhash);
           if (!list || !list.length) continue;
-          const src = list.pop();
-          const pair = { up: p, src };
-          pairs.push(pair); pairByUp.set(p, pair); pairBySrc.set(src, pair);
+          addPair(p, list.pop());
         }
+
+        // 3) same basename + empty destination (last resort for a move+edit made while the app was closed)
+        const nameOf = (k) => { const parts = splitRel(k); return nfc(parts.name).toLowerCase(); };
+        const byName = new Map();
+        for (const p of plan) {
+          if (p.action === 'deleteRemote' && p.R && !pairBySrc.has(p)) {
+            const n = nameOf(p.key);
+            if (!byName.has(n)) byName.set(n, []);
+            byName.get(n).push(p);
+          }
+        }
+        for (const p of plan) {
+          if (p.action !== 'upload' || !p.L || p.R || pairByUp.has(p)) continue;   // destination must be free
+          const list = byName.get(nameOf(p.key));
+          if (!list || !list.length) continue;
+          addPair(p, list.pop());
+        }
+        // Drop the hints we just used so they cannot match a later, unrelated file.
+        for (const from of consumedHints) { try { delete this.manifest.data.meta.moveHints[from]; } catch (e) { /* ignore */ } }
       }
 
       // ---- size + network guards (skip heavy transfers without ever touching data) ----
@@ -637,7 +686,7 @@ class SyncEngine {
           if (pair && moveDone.has(pair)) { rep.skipped++; continue; }   // the other half of a completed move
           if (pair && !moveFailed.has(pair)) {
             try {
-              if (await this._executeMove(pair.up, pair.src, rep)) { moveDone.add(pair); netFails = 0; continue; }
+              if (await this._executeMove(pair.up, pair.src, rep, pair.contentChanged)) { moveDone.add(pair); netFails = 0; continue; }
               moveFailed.add(pair);   // target name already exists -> upload will replace it instead
             } catch (e) {
               moveFailed.add(pair);
@@ -703,9 +752,11 @@ class SyncEngine {
     return rep;
   }
 
-  /** Renames/moves an existing remote file in place (no re-upload). `up` is the new-path plan item, `src` the
-   *  old-path one. Returns false when the destination name is already taken (the normal upload handles that). */
-  async _executeMove(up, src, rep) {
+  /** Renames/moves an existing remote file in place (no re-upload), then — when the user kept editing after the
+   *  move — uploads the new content as an in-place revision so only the changed chunks cross the wire and the
+   *  server file keeps its id. `up` is the new-path plan item, `src` the old-path one. Returns false when the
+   *  destination name is already taken (the normal upload handles that). */
+  async _executeMove(up, src, rep, contentChanged) {
     if (!src.R || !src.R.id) return false;
     const { dir, name } = splitRel(up.key);
     await this._ensureFolders(dir);
@@ -713,10 +764,26 @@ class SyncEngine {
     const idx = await this._dirIndex(folderPath);
     const existing = idx.files.get(nfc(name));
     if (existing && existing.id !== src.R.id) return false;
-    const res = await this.client.move(src.R.id, { name, path: folderPath });
-    this._markRemoteMutated();
+    let res = await this.client.move(src.R.id, { name, path: folderPath });
+    this._remoteMutated = true;
+
+    // The move itself is done (same id, new path). Now sync any content the user changed afterwards, in place.
+    let lhash = up.lhash;
+    if (contentChanged) {
+      const data = await this.local.readBinary(up.key);
+      const lstat = await this.local.stat(up.key);
+      try {
+        const revised = await this._replaceUpload({ name, folderPath, data, mtime: lstat.mtime, old: res, onProgress: null });
+        if (revised && revised.id) { res = revised; lhash = await sha256Hex(data); }
+      } catch (e) {
+        // The path change already succeeded; if the content update fails, leave the file at the new path and let
+        // the next run upload it normally (the ledger below records the move so nothing is duplicated).
+        this.log('warn', `Moved ${src.key} to ${up.key} but could not update its content (${this.client.redact(e.message)}); will retry.`);
+      }
+    }
+
     const lstat = await this.local.stat(up.key);
-    this._record(up.key, { lhash: up.lhash, lstat, remote: res });
+    this._record(up.key, { lhash, lstat, remote: res });
     this.manifest.deleteFile(src.key);
     idx.files.set(nfc(name), res);
     try {
@@ -725,7 +792,7 @@ class SyncEngine {
     } catch (e) { /* cache only */ }
     this._touched.set(up.key, res.id);
     rep.moved++;
-    this.log('info', `Moved in place: ${src.key} -> ${up.key}`);
+    this.log('info', `Moved in place: ${src.key} -> ${up.key}${contentChanged ? ' (with edits)' : ''}`);
     return true;
   }
 
