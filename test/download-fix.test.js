@@ -2,13 +2,14 @@
 // Regression tests for the "Incomplete download: 941/<n> bytes" failure:
 //   A single content response was treated as authoritative and any shortfall was fatal, so a truncated
 //   stream or a stale Content-Range total produced a hard error even though the object was intact and a
-//   retry/tail-fetch would have succeeded. These tests reproduce each mechanism and assert the fix:
-//   the download completes byte-for-byte, integrity is verified, and a failed download never touches the
-//   local file.
+//   retry/tail-fetch would have succeeded. Short bodies with consistent evidence can be continued; a
+//   contradictory manifest/range generation must be rejected before writing. A fresh run can then replan.
+//   Successful downloads are byte-for-byte verified and failed downloads never touch the local file.
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const crypto = require('crypto');
-const { makeEnv, nodeTransport } = require('./helpers');
+const { makeEnv: makeBaseEnv } = require('./helpers');
+const makeEnv = (opts = {}) => makeBaseEnv({ legacyFeatures: true, ...opts });
 const { sha } = require('./mockServer');
 const { downloadFile } = require('../src/DownloadManager');
 
@@ -33,7 +34,7 @@ test('truncated stream (941 of 5348 advertised) is continued to the full file, b
   } finally { await env.stop(); }
 });
 
-test('reproduces the exact "941/5348" case: a stale Content-Range total is reconciled and the tail fetched', async () => {
+test('the exact "941/5348" stale Content-Range is rejected against the manifest, then a fresh read succeeds', async () => {
   const env = await makeEnv();
   try {
     const data = make5348();
@@ -42,8 +43,13 @@ test('reproduces the exact "941/5348" case: a stale Content-Range total is recon
     env.server.staleContent = { partial: 941 };
     const file = await env.client.getFile(env.server.findLive('/Vault/', 'note.md').id);
 
-    const out = await downloadFile(env.client, file, { chunkBytes: 4 * 1024 * 1024 });
-    assert.equal(out.byteLength, SIZE, 'the missing tail was fetched and reassembled');
+    await assert.rejects(downloadFile(env.client, file, { chunkBytes: 4 * 1024 * 1024 }),
+      (e) => e.code === 'content_changed' && /content size changed/i.test(e.message));
+    assert.equal(env.server.faultHits.staleContent, 1, 'the contradictory response was exercised');
+    assert.equal(file.size, SIZE, 'the pinned manifest size was not replaced by the short response');
+    env.server.staleContent = null;
+    const out = await downloadFile(env.client, await env.client.getFile(file.id), { chunkBytes: 4 * 1024 * 1024 });
+    assert.equal(out.byteLength, SIZE, 'a fresh transfer uses consistent content evidence');
     assert.equal(shaHex(out), sha(data));
   } finally { await env.stop(); }
 });
@@ -59,6 +65,8 @@ test('a 503 on the first content request is retried and the file still downloads
     const out = await downloadFile(client, file, { chunkBytes: 4 * 1024 * 1024 });
     assert.equal(out.byteLength, SIZE);
     assert.equal(shaHex(out), sha(data));
+    assert.equal(env.server.busyFirst, 0, 'both content failures were actually retried');
+    assert.equal(env.server.faultHits.busyFirst, 2);
   } finally { await env.stop(); }
 });
 
@@ -74,6 +82,7 @@ test('integrity: a same-length but corrupted response is rejected (checksum), no
       downloadFile(env.client, file, { chunkBytes: 4 * 1024 * 1024, expectSha: expect, verifyLabel: 'bad.md' }),
       /checksum mismatch/i,
     );
+    assert.ok(env.server.faultHits.corruptContent >= 1, 'the corrupt content endpoint was exercised');
   } finally { await env.stop(); }
 });
 
@@ -116,10 +125,11 @@ test('engine: a short/corrupt remote never leaves a truncated local file, and re
     assert.equal(r.downloaded, 0, JSON.stringify(r));
     assert.ok(r.errors >= 1 || r.failures.length >= 1, 'an error is reported, not silent acceptance');
     assert.equal(env.local.files.has('corrupt.md'), false, 'no corrupt/partial file was written locally');
+    assert.ok(env.server.faultHits.corruptContent >= 1);
   } finally { await env.stop(); }
 });
 
-test('engine: refreshes the manifest and retries if the remote changes during download', async () => {
+test('engine: rejects a changed remote generation, then a fresh run downloads the current bytes', async () => {
   const env = await makeEnv();
   try {
     const before = make5348();
@@ -136,21 +146,35 @@ test('engine: refreshes the manifest and retries if the remote changes during do
     };
 
     const r = await env.engine.syncNow();
-    assert.equal(r.status, 'ok', JSON.stringify(r));
-    assert.equal(r.downloaded, 1, JSON.stringify(r));
-    assert.equal(sha(env.local.files.get('race.md').data), sha(after), 'the retry fetched the current remote content');
+    assert.equal(changed, true, 'the generation race was exercised');
+    assert.equal(r.status, 'errors', JSON.stringify(r));
+    assert.equal(r.downloaded, 0);
+    assert.match(r.failures[0].error, /content changed before download/i);
+    assert.equal(env.local.files.has('race.md'), false, 'new bytes cannot be accepted under old generation evidence');
+    assert.equal(env.manifest.getFile('race.md'), undefined, 'no false baseline was published');
+    const next = await env.engine.syncNow();
+    assert.equal(next.status, 'ok', JSON.stringify(next));
+    assert.equal(next.downloaded, 1);
+    assert.equal(sha(env.local.files.get('race.md').data), sha(after), 'a fresh run replanned the current generation');
   } finally { await env.stop(); }
 });
 
-test('engine: the 941/5348 case now syncs successfully and the local copy matches byte-for-byte', async () => {
+test('engine: contradictory 941/5348 content is not written, and a fresh consistent run converges', async () => {
   const env = await makeEnv();
   try {
     const data = make5348();
     env.server.addFile('/Vault/', 'كيف تقلل استخدام الرامات.md', data);
     env.server.staleContent = { partial: 941 };   // reproduce the reported failure mode end-to-end
     const r = await env.engine.syncNow();
-    assert.equal(r.status, 'ok', JSON.stringify(r));
-    assert.equal(r.downloaded, 1, JSON.stringify(r));
+    assert.equal(r.status, 'errors', JSON.stringify(r));
+    assert.equal(r.downloaded, 0);
+    assert.match(r.failures[0].error, /content size changed/i);
+    assert.equal(env.local.files.has('كيف تقلل استخدام الرامات.md'), false);
+    assert.equal(env.server.faultHits.staleContent, 1, 'the short stale response was actually served');
+    env.server.staleContent = null;
+    const next = await env.engine.syncNow();
+    assert.equal(next.status, 'ok', JSON.stringify(next));
+    assert.equal(next.downloaded, 1);
     assert.equal(sha(env.local.files.get('كيف تقلل استخدام الرامات.md').data), sha(data), 'local file is byte-for-byte correct');
   } finally { await env.stop(); }
 });
@@ -158,7 +182,7 @@ test('engine: the 941/5348 case now syncs successfully and the local copy matche
 test('a stale LARGER metadata size (past-EOF range -> HTTP 416) is accepted, not treated as an error', async () => {
   // Reproduces "compare <file>: HTTP 416": the listing/metadata claimed more bytes than the object stores,
   // so the tail fetch hit a range past EOF. The 416 body-less reply with "bytes */<total>" is authoritative.
-  const env = await makeEnv();
+  const env = await makeEnv({ server: { chunkManifests: false } });
   try {
     const data = make5348();
     const rec = env.server.addFile('/Vault/', 'stale.md', data);
@@ -168,6 +192,7 @@ test('a stale LARGER metadata size (past-EOF range -> HTTP 416) is accepted, not
     assert.equal(out.byteLength, SIZE, 'accepted the real (shorter) object size');
     assert.equal(shaHex(out), sha(data), 'byte-for-byte identical');
     assert.equal(file.size, SIZE, 'the trusted size was corrected on the entry');
+    assert.ok(env.server.log.some((r) => r.range === `bytes=${SIZE}-${SIZE + 4 * 1024 * 1024 - 1}`), 'the tail request actually exercised HTTP 416');
   } finally { await env.stop(); }
 });
 
@@ -177,7 +202,7 @@ test('engine: a stale larger remote size no longer fails the "compare" step with
     const data = make5348();
     env.local.put('stale.md', data);                       // same content locally
     const rec = env.server.addFile('/Vault/', 'stale.md', data);
-    rec.size = 9999;                                       // listing lies (larger) about the size
+    env.server.listingSizeOverride = { [rec.id]: 9999 };    // the actual listing field lies about the size
     rec.lastModified = rec.lastModified + 1;               // make it look changed so a compare happens
     const r = await env.engine.syncNow();
     assert.equal(r.status, 'ok', JSON.stringify(r));
@@ -196,6 +221,7 @@ test('off-by-one: first response short by one byte, tail read finishes it (33-by
     const out = await downloadFile(env.client, file, { chunkBytes: 4 * 1024 * 1024 });
     assert.equal(out.byteLength, 33);
     assert.equal(shaHex(out), sha(data));
+    assert.equal(env.server.contentTruncate.times, 0, 'the one-byte truncation was exercised');
   } finally { await env.stop(); }
 });
 
@@ -220,7 +246,7 @@ test('a stale LISTING size larger than the object is resolved by the manifest ch
   } finally { await env.stop(); }
 });
 
-test('a wrong object served for a file id is REJECTED by the manifest checksum, never accepted as content', async () => {
+test('a wrong shorter object is REJECTED by manifest size evidence, never accepted as content', async () => {
   const env = await makeEnv();
   try {
     const real = make5348();
@@ -228,16 +254,20 @@ test('a wrong object served for a file id is REJECTED by the manifest checksum, 
     const wrong = Buffer.alloc(941); wrong.fill(9);          // some other file's bytes
     env.server.contentOverride = wrong;                       // content endpoint now serves the wrong object
     const file = await env.client.getFile(rec.id);
-    const expect = (await env.client.request({ path: `/files/${rec.id}/chunks` })).chunks[0].checksum;
+    const manifest = await env.client.request({ path: `/files/${rec.id}/chunks` });
+    assert.equal(manifest.chunks.length, 1, 'this fixture explicitly has one whole-file chunk');
+    const expect = manifest.chunks[0].checksum;
+    assert.equal(expect, sha(real), 'whole-file SHA is not the ordered chunk fingerprint');
     await assert.rejects(
       downloadFile(env.client, file, { chunkBytes: 4 * 1024 * 1024, expectSha: expect, verifyLabel: 'x.md' }),
-      /checksum mismatch/i,
+      (e) => e.code === 'content_changed' && /content size changed/i.test(e.message),
     );
     // And the engine reports an error rather than storing the wrong bytes.
     env.local.files.delete('x.md');
     const r = await env.engine.syncNow();
     assert.ok(r.failures.length >= 1 || r.errors >= 1, 'reported, not silent: ' + JSON.stringify(r));
     assert.equal(env.local.files.has('x.md'), false, 'the wrong object was never written locally');
+    assert.ok(env.server.faultHits.contentOverride >= 2, 'both standalone and engine reads served the wrong object');
   } finally { await env.stop(); }
 });
 
@@ -276,5 +306,6 @@ test('atomic replace: a failed download leaves the existing local file intact', 
     assert.ok(r.failures.length >= 1 || r.errors >= 1, 'failure reported, not silently accepted');
     assert.equal(env.local.files.get('keep.md').data.length, SIZE);
     assert.equal(sha(env.local.files.get('keep.md').data), localShaBefore, 'local file untouched after a failed download');
+    assert.ok(env.server.faultHits.corruptContent >= 1, 'the content corruption caused the failure');
   } finally { await env.stop(); }
 });

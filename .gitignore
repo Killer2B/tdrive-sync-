@@ -3,3 +3,7 @@ node_modules/
 tdrive-sync-log.txt
 .DS_Store
 Thumbs.db
+data.json
+sync-state*.json
+.kilo/
+.obsidian/

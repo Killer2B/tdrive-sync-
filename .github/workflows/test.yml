@@ -16,8 +16,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
-      - name: Build bundle
-        run: npm run build
+      - name: Build bundle and safe installation zip
+        run: npm run package
       - name: Run tests
         run: npm test
       - name: Verify the committed main.js matches src

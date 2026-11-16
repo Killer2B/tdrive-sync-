@@ -3,7 +3,8 @@
 // the file keeps its id, the commit is atomic, and the old bytes are archived server-side.
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { makeEnv, nodeTransport } = require('./helpers');
+const { makeEnv: makeBaseEnv, nodeTransport } = require('./helpers');
+const makeEnv = (opts = {}) => makeBaseEnv({ legacyFeatures: true, ...opts });
 const { uploadFile, uploadRevision } = require('../src/UploadManager');
 
 const sha = (b) => require('crypto').createHash('sha256').update(b).digest('hex');
@@ -72,8 +73,7 @@ test('append-only growth reuses the leading chunks', async () => {
   } finally { await env.stop(); }
 });
 
-test('a CDC file is replaced (not revised) on the second run, with correct content', async () => {
-  // The deployed server cannot revise a CDC-chunked file in place, so the engine replaces it instead.
+test('a CDC file is revised atomically on the second run, preserving its id and old bytes', async () => {
   const env = await makeEnv();
   try {
     const before = body(2 * 1024 * 1024, 11);
@@ -86,7 +86,13 @@ test('a CDC file is replaced (not revised) on the second run, with correct conte
     r = await env.engine.syncNow();
     assert.equal(r.uploaded, 1, JSON.stringify(r));
     const live = env.server.findLive('/Vault/Notes/', 'big.bin');
+    assert.equal(live.id, id, 'the base id is unchanged');
     assert.equal(Buffer.compare(live.bytes, after), 0, 'content is correct');
+    assert.deepEqual(live.versions[0].bytes, before, 'the previous bytes were archived');
+    env.server.log.length = 0;
+    r = await env.engine.syncNow();
+    assert.equal(r.uploaded + r.downloaded, 0, JSON.stringify(r));
+    assert.equal(env.server.log.filter((l) => l.method === 'DELETE' || /\/content$|\/parts\//.test(l.route)).length, 0);
   } finally { await env.stop(); }
 });
 
@@ -112,20 +118,41 @@ test('with CDC off, a fixed-chunk file IS revised in place (same id, nothing tra
   } finally { await env.stop(); }
 });
 
-test('server without revision support falls back to a normal upload and still syncs', async () => {
-  const env = await makeEnv({ server: { noRevisions: true } });
+test('server without multipart revisions preserves inline-update ids and refuses oversized replacement without data loss', async () => {
+  const env = await makeEnv({ server: { noRevisions: true }, settings: { cdcFiles: false } });
   try {
-    const before = body(1.5 * 1024 * 1024, 5);
+    const before = body(100000, 5);
     env.local.put('Notes/big.bin', before);
     await env.engine.syncNow();
     const id1 = env.server.findLive('/Vault/Notes/', 'big.bin').id;
-    const after = Buffer.from(before); after[700000] ^= 0xff;
+    const after = Buffer.from(before); after[70000] ^= 0xff;
     env.local.put('Notes/big.bin', after);
+    env.server.log.length = 0;
+    const inline = await env.engine.syncNow();
+    assert.equal(inline.status, 'ok', JSON.stringify(inline));
+    assert.equal(inline.uploaded, 1);
+    const updated = env.server.findLive('/Vault/Notes/', 'big.bin');
+    assert.equal(updated.id, id1, 'inline replacement keeps the existing id');
+    assert.deepEqual(updated.bytes, after);
+    assert.deepEqual(updated.versions[0].bytes, before, 'inline replacement archives old bytes');
+    assert.ok(env.server.log.some((l) => l.method === 'PATCH' && l.route === `/files/${id1}`), 'the supported inline endpoint was exercised');
+    assert.equal(env.server.log.filter((l) => l.method === 'DELETE' || l.route === '/uploads').length, 0);
+    const baseline = JSON.parse(JSON.stringify(env.manifest.getFile('Notes/big.bin')));
+    const oversized = body(1.5 * 1024 * 1024, 6);
+    assert.ok(oversized.length > (await env.client.limits()).oneShotMaxBytes, 'multipart input exceeds the advertised inline maximum');
+    env.local.put('Notes/big.bin', oversized);
+    env.server.log.length = 0;
     const r = await env.engine.syncNow();
-    assert.equal(r.status, 'ok', JSON.stringify(r));
+    assert.equal(r.status, 'errors', JSON.stringify(r));
+    assert.equal(r.uploaded, 0);
+    assert.match(r.failures[0].error, /revisions not supported/);
     const live = env.server.findLive('/Vault/Notes/', 'big.bin');
-    assert.equal(Buffer.compare(live.bytes, after), 0, 'content correct after fallback');
-    assert.notEqual(live.id, id1, 'fallback creates a new file, and the old one was trashed');
+    assert.equal(live.id, id1, 'no replacement id was created');
+    assert.deepEqual(live.bytes, after, 'the committed remote base remains intact after the failed oversized replacement');
+    assert.deepEqual(env.local.files.get('Notes/big.bin').data, oversized, 'the oversized local edit remains available');
+    assert.deepEqual(env.manifest.getFile('Notes/big.bin'), baseline, 'the failed replacement did not publish a baseline');
+    assert.equal(env.server.liveFiles().length, 1);
+    assert.equal(env.server.log.filter((l) => l.method === 'DELETE' || l.method === 'POST' && l.route === '/files').length, 0, 'no destructive fallback or new upload');
   } finally { await env.stop(); }
 });
 

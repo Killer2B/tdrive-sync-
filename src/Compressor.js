@@ -51,17 +51,18 @@ function extOf(name) {
 async function gunzipBytes(buf) {
   const ds = new DecompressionStream('gzip');
   const w = ds.writable.getWriter();
-  w.write(new Uint8Array(buf));
-  w.close();
-  return new Response(ds.readable).arrayBuffer();
+  // Drain concurrently: awaiting the writer first can deadlock on backpressure.
+  const read = new Response(ds.readable).arrayBuffer();
+  const [, , plain] = await Promise.all([w.write(new Uint8Array(buf)), w.close(), read]);
+  return plain;
 }
 
 async function gzipBytes(buf) {
   const cs = new CompressionStream('gzip');
   const w = cs.writable.getWriter();
-  w.write(new Uint8Array(buf));
-  w.close();
-  return new Response(cs.readable).arrayBuffer();
+  const read = new Response(cs.readable).arrayBuffer();
+  const [, , packed] = await Promise.all([w.write(new Uint8Array(buf)), w.close(), read]);
+  return packed;
 }
 
 const be32 = (n) => new Uint8Array([(n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255]);

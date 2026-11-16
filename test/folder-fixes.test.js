@@ -15,7 +15,7 @@ test('deleting a 12-file folder: blocked deletions are recorded and logged, then
     const r1 = await env.engine.syncNow();
     assert.equal(r1.deletedRemote, 0);
     assert.equal(r1.blockedDeletes.reason, 'limit');
-    assert.equal(r1.blockedDeletes.items.length, 12);
+    assert.equal(r1.blockedDeletes.items.length, 13, 'files plus their folder are reviewed together');
     assert.ok(env.manifest.data.log.some((l) => /Deletions blocked/.test(l.msg)), 'warning reaches the persistent log');
     assert.equal(env.server.folders.has('/Vault/Big/'), true, 'nothing deleted without approval');
     const r2 = await env.engine.syncNow({ approveDeletes: true });
@@ -35,7 +35,7 @@ test('renaming a 12-file folder leaves no duplicates once deletions are approved
     await env.engine.syncNow();
     many(env, 'New', 12); env.local.removeDir('Old');
     const r1 = await env.engine.syncNow();
-    assert.equal(r1.blockedDeletes.items.length, 12);
+    assert.equal(r1.blockedDeletes.items.length, 13);
     await env.engine.syncNow({ approveDeletes: true });
     assert.equal(env.server.liveFiles().length, 13);
     assert.equal(env.server.folders.has('/Vault/Old/'), false);
@@ -62,7 +62,7 @@ test('remote folder deleted with 12 files: approval trashes local files and fold
     await env.engine.syncNow();
     env.server.removeFolder('/Vault/Big/');
     const r1 = await env.engine.syncNow();
-    assert.equal(r1.blockedDeletes.items.length, 12);
+    assert.equal(r1.blockedDeletes.items.length, 13);
     await env.engine.syncNow({ approveDeletes: true });
     assert.equal([...env.local.files.keys()].filter((k) => k.startsWith('Big/')).length, 0);
     assert.ok(env.local.trashedDirs.includes('Big'));

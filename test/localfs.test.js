@@ -8,14 +8,14 @@ const Module = require('module');
 const { makeEnv, MemFS } = require('./helpers');
 const { splitRel } = require('../src/util');
 
-class TFile { constructor(path, data) { this.path = path; this.data = data; this.stat = { size: data.length, mtime: 1000 }; } }
+class TFile { constructor(path, data) { this.path = path; this.data = data; this.stat = { size: data.length, mtime: 2000 }; } }
 
 function loadPlugin() {
   const proxy = () => new Proxy(function () {}, { get: (t, k) => (k === 'then' ? undefined : (k in t ? t[k] : proxy())), apply: () => proxy(), set: (t, k, v) => { t[k] = v; return true; } });
   const stub = {
     Plugin: class { constructor(app, manifest) { this.app = app; this.manifest = manifest; this.data = {}; }
       async loadData() { return this.data; } async saveData(d) { this.data = d; }
-      addCommand() {} addSettingTab() {} registerView() {} addRibbonIcon() {} addStatusBarItem() { return { setText() {} }; } registerInterval() {} registerEvent() {} },
+      addCommand() {} addSettingTab() {} registerView() {} addRibbonIcon() {} addStatusBarItem() { return { setText() {} }; } registerInterval() {} },
     PluginSettingTab: class {}, Setting: class {}, Notice: class {}, Modal: class {}, ItemView: class {}, TFile, requestUrl: async () => ({}),
   };
   const orig = Module._load;
@@ -43,7 +43,7 @@ function strictApp({ indexLag = false, hideFolderStat = false } = {}) {
       if (par && !indexedFolders.has(par)) throw new Error('ENOENT: parent folder unknown to vault');
       disk.set(p, Buffer.from(b)); if (!indexLag) indexed.set(p, new TFile(p, Buffer.from(b)));
     },
-    getAbstractFileByPath: (p) => indexed.get(p) || null,
+    getAbstractFileByPath: (p) => indexed.get(p) || (indexedFolders.has(p) ? { path: p, children: [] } : null),
     getFiles: () => [...indexed.values()],
   };
   return { app: { vault, fileManager: {}, workspace: { onLayoutReady() {} } }, disk, diskFolders, indexed };
@@ -52,6 +52,7 @@ function strictApp({ indexLag = false, hideFolderStat = false } = {}) {
 async function localFor(fa) {
   const Plugin = loadPlugin();
   const plugin = new Plugin(fa.app, { dir: '.obsidian/plugins/tdrive-sync' });
+  plugin.data = { language: 'ar' };
   await plugin.onload();
   return plugin.local;
 }
@@ -59,11 +60,18 @@ const buf = (s) => new TextEncoder().encode(s).buffer;
 
 test('writing into nested folders on a strict vault: creates them, tolerates "already exists", file appears', async () => {
   const fa = strictApp({ hideFolderStat: true });   // stat cannot tell us a folder exists
-  fa.diskFolders.add('Notes');                       // a parent that already exists on disk
+  await fa.app.vault.createFolder('Notes');           // an existing folder registered through the vault API
   const local = await localFor(fa);
   await local.writeBinary('Notes/Deep/ملاحظة.md', buf('نص'), 5000);
   assert.equal(fa.disk.get('Notes/Deep/ملاحظة.md').toString(), 'نص');
   assert.ok(fa.diskFolders.has('Notes/Deep'));
+});
+
+test('an unindexed disk parent is not silently bypassed with raw writes', async () => {
+  const fa = strictApp({ hideFolderStat: true }); fa.diskFolders.add('Notes');
+  const local = await localFor(fa);
+  await assert.rejects(local.writeBinary('Notes/a.md', buf('new')), /not registered|index/i);
+  assert.equal(fa.disk.has('Notes/a.md'), false);
 });
 
 test('a real folder-creation failure names the folder (shown in the sync report)', async () => {
@@ -72,7 +80,7 @@ test('a real folder-creation failure names the folder (shown in the sync report)
   fa.app.vault.createFolder = async () => { throw new Error('boom'); };
   fa.app.vault.adapter.mkdir = async () => { throw new Error('boom2'); };
   const local = await localFor(fa);
-  await assert.rejects(() => local.writeBinary('Notes/a.md', buf('x')), /(تعذر إنشاء المجلد المحلي "Notes"|Could not create the local folder "Notes").*(ملف بنفس الاسم|same name)/);
+  await assert.rejects(() => local.writeBinary('Notes/a.md', buf('x')), /تعذر إنشاء المجلد المحلي "Notes".*ملف بنفس الاسم/);
 });
 
 test('file written to disk but missing from the vault index is NOT treated as deleted locally', async () => {
@@ -108,6 +116,7 @@ test('ObsidianLocalFS: listFolders / trashFolder (folders = objects with childre
   const trashed = [];
   fa.app.vault.getAllLoadedFiles = () => [folder('/'), folder('Notes'), folder('Notes/Deep'), { path: 'a.md', stat: {} }];
   fa.app.vault.getAbstractFileByPath = (p) => (p === 'Notes' ? folder('Notes') : null);
+  fa.app.vault.adapter.list = async () => ({ files: [], folders: [] });
   fa.app.fileManager = { trashFile: async (f) => { trashed.push(f.path); } };
   const local = await localFor(fa);
   assert.deepEqual(await local.listFolders(), ['Notes', 'Notes/Deep']);

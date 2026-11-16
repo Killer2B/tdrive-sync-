@@ -87,7 +87,7 @@ test('a local folder that still has an edited/new file is NOT trashed when the s
   } finally { await env.stop(); }
 });
 
-test('server that only supports DELETE /folders?path= still works (id route fails first, then path)', async () => {
+test('documented DELETE /folders?path=parent&name=segment works without folder ids', async () => {
   const env = await makeEnv({ server: { folderDelete: 'byPath' } });
   try {
     seed(env); await env.engine.syncNow();
@@ -97,7 +97,7 @@ test('server that only supports DELETE /folders?path= still works (id route fail
   } finally { await env.stop(); }
 });
 
-test('server that rejects folder deletion: reported as an error naming the attempts, nothing else is harmed', async () => {
+test('server that rejects folder deletion: reported with folder path and HTTP error, nothing else is harmed', async () => {
   const env = await makeEnv({ server: { folderDelete: 'none' } });
   try {
     seed(env); await env.engine.syncNow();
@@ -105,7 +105,7 @@ test('server that rejects folder deletion: reported as an error naming the attem
     const r = await env.engine.syncNow();
     assert.equal(r.status, 'errors');
     const f = r.failures.find((x) => x.path === 'Notes/Deep/' || x.path === 'Notes/');
-    assert.ok(f && /Folder delete failed/.test(f.error) && /405/.test(f.error), JSON.stringify(r.failures));
+    assert.ok(f && /405|method_not_allowed/.test(f.error), JSON.stringify(r.failures));
     assert.equal(env.server.liveFiles().length, 2);
   } finally { await env.stop(); }
 });
@@ -141,8 +141,8 @@ test('more folder deletions than the limit are blocked', async () => {
     env.local.dirs.delete('A'); env.local.dirs.delete('B');
     env.server.liveFiles().filter((f) => /\/(A|B)\/$/.test(f.path)).forEach((f) => { f.trashed = true; });
     const r = await env.engine.syncNow();
-    assert.equal(r.deletedRemote, 1, JSON.stringify(r));
-    assert.ok(r.warnings.some((w) => /Folder deletions blocked/.test(w)), JSON.stringify(r.warnings));
+    assert.equal(r.deletedRemote, 0, JSON.stringify(r));
+    assert.equal(r.blockedDeletes.items.length, 2, 'all folder deletions need approval, not a partial silent batch');
   } finally { await env.stop(); }
 });
 

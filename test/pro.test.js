@@ -3,7 +3,8 @@
 // share links and remote search.
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { makeEnv, nodeTransport } = require('./helpers');
+const { makeEnv: makeBaseEnv, nodeTransport } = require('./helpers');
+const makeEnv = (opts = {}) => makeBaseEnv({ legacyFeatures: true, ...opts });
 const { uploadFile, uploadRevision } = require('../src/UploadManager');
 
 const body = (n, s0) => { const b = Buffer.alloc(n); let s = s0 >>> 0; for (let i = 0; i < n; i++) { s = (s * 1664525 + 1013904223) >>> 0; b[i] = (s >>> 24) & 255; } return b; };
@@ -157,7 +158,7 @@ test('transient server 503 surfaces as a soft "deferred", never a red "aborted"'
     assert.equal(rep.status, 'deferred', JSON.stringify(rep));
     assert.notEqual(rep.status, 'aborted');
     const log = env.manifest.data.log.slice(-3).map((l) => l.level);
-    assert.ok(!log.includes('error') || true, 'deferred is logged as a warning, not an error');
+    assert.ok(!log.includes('error'), 'deferred is logged as a warning, not an error');
   } finally { await env.stop(); }
 });
 

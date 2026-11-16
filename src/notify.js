@@ -45,7 +45,11 @@ const counts = (rep) => ({
   err: rep.errors || 0,
 });
 
-const firstError = (rep) => (rep.failures && rep.failures[0] && rep.failures[0].error) ? String(rep.failures[0].error) : '';
+const firstError = (rep) => {
+  if (rep.failures && rep.failures[0] && rep.failures[0].error) return String(rep.failures[0].error);
+  const block = rep.blockedFolders && rep.blockedFolders[0];
+  return block ? [block.path, block.error || block.message || block.code].filter(Boolean).join(': ') : '';
+};
 
 const durationText = (ms) => {
   if (!Number.isFinite(ms) || ms < 0) return '';
@@ -65,7 +69,7 @@ function reasonLabel(t, reason) {
 }
 
 function statusLabel(t, status) {
-  const map = { offline: 'notify.state.offline', auth: 'notify.state.auth', paused: 'notify.state.paused', locked: 'notify.state.locked', busy: 'notify.state.busy', aborted: 'notify.state.aborted', deferred: 'notify.state.deferred' };
+  const map = { offline: 'notify.state.offline', auth: 'notify.state.auth', paused: 'notify.state.paused', locked: 'notify.state.locked', busy: 'notify.state.busy', aborted: 'notify.state.aborted', deferred: 'notify.state.deferred', blocked: 'notify.state.blocked' };
   return map[status] ? t(map[status]) : String(status || '');
 }
 
@@ -79,6 +83,7 @@ function statusIcon(status) {
   if (status === 'offline') return 'offline';
   if (status === 'auth') return 'key';
   if (status === 'aborted' || status === 'paused') return 'warning';
+  if (status === 'blocked') return 'warning';
   return 'error';
 }
 
@@ -98,7 +103,7 @@ function formatResult(style, t, rep) {
 
   if (style === 'technical') {
     const msg = `↑${k.up} ↓${k.down} ⇄${k.moved} =${k.skip} ⚠${k.conf} ✗${k.err}`;
-    const text = ok ? t('notice.synced', { msg }) : t('notice.failed', { status: rep.status, msg }) + (firstError(rep) ? '\n' + firstError(rep) : '');
+    const text = ok ? t('notice.synced', { msg }) : t('notice.failed', { status: rep.status === 'blocked' ? statusLabel(t, rep.status) : rep.status, msg }) + (firstError(rep) ? '\n' + firstError(rep) : '');
     return { style, text, rows: null, timeout: ok ? 0 : 10000 };
   }
 

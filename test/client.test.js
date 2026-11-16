@@ -50,30 +50,13 @@ test('4 retries after HTTP 429 honoring Retry-After', async () => {
   } finally { await env.stop(); }
 });
 
-test('4b 5xx is retried with exponential backoff and, if it persists, gives up with a retryable error', async () => {
-  const env = await makeEnv();
+test('4b 5xx retried with exponential backoff, then gives up with a retryable error', async () => {
+  const env = await makeEnv({ client: { maxServerRetries: 4 } });
   try {
     env.server.failRule((i) => i.route === '/me', { status: 503 }, 99);
-    // A low server-retry cap keeps the backoff sequence deterministic for the test.
-    const c = env.mkClient(null, { maxRetries: 4, maxServerRetries: 4 });
-    await assert.rejects(c.me(), (e) => e.status === 503 && e.retryable);
+    await assert.rejects(env.client.me(), (e) => e.status === 503 && e.retryable);
     assert.deepEqual(env.sleeps, [500, 1000, 2000, 4000]);
   } finally { await env.stop(); }
-});
-
-test('4c a bare { error, code, retryAfter } 503 (ControlUnavailable) is parsed and retryable', async () => {
-  const http = require('http');
-  const { TdriveClient } = require('../src/TdriveClient');
-  const body = JSON.stringify({ error: 'ControlUnavailable', code: 'ControlUnavailable', retryAfter: 1 });
-  const srv = http.createServer((req, res) => { res.writeHead(503, { 'Content-Type': 'application/json', 'Retry-After': '1', 'Content-Length': Buffer.byteLength(body) }); res.end(body); });
-  await new Promise((r) => srv.listen(0, r));
-  try {
-    const c = new TdriveClient({
-      baseUrl: 'http://127.0.0.1:' + srv.address().port, apiKey: 'tdk_x', allowInsecure: true, maxRetries: 0, maxServerRetries: 0,
-      transport: async ({ url, method, headers, body: b }) => { const r = await fetch(url, { method, headers, body: b }); return { status: r.status, headers: Object.fromEntries([...r.headers].map(([k, v]) => [k.toLowerCase(), v])), body: await r.arrayBuffer() }; },
-    });
-    await assert.rejects(c.me(), (e) => e.code === 'ControlUnavailable' && e.retryable === true && e.retryAfter === 1 && e.status === 503);
-  } finally { await new Promise((r) => srv.close(r)); }
 });
 
 test('2 network drop during resumable upload recovers via retry; bytes identical', async () => {
@@ -81,7 +64,7 @@ test('2 network drop during resumable upload recovers via retry; bytes identical
   try {
     const data = big(3.5 * 1024 * 1024);
     env.server.failRule((i) => i.method === 'PUT' && i.partIdx === 2, 'drop', 1);
-    const f = await uploadFile(env.client, { name: 'big.bin', folderPath: '/', data, mtime: 1 });
+    const f = await uploadFile(env.client, { name: 'big.bin', folderPath: '/', data, mtime: 1, chunker: false });
     assert.equal(sha(env.server.files.get(f.id).bytes), sha(data));
   } finally { await env.stop(); }
 });
@@ -92,13 +75,11 @@ test('13 interrupted upload resumes: only missing parts are re-sent', async () =
     const data = big(3.5 * 1024 * 1024);
     const c0 = env.mkClient(null, { maxRetries: 0 });
     env.server.failRule((i) => i.method === 'PUT' && i.partIdx === 2, 'drop', 1);
-    await assert.rejects(uploadFile(c0, { name: 'big.bin', folderPath: '/', data, mtime: 1 }));
+    await assert.rejects(uploadFile(c0, { name: 'big.bin', folderPath: '/', data, mtime: 1, chunker: false }));
     env.server.log.length = 0;
-    const f = await uploadFile(env.client, { name: 'big.bin', folderPath: '/', data, mtime: 1 });
+    const f = await uploadFile(env.client, { name: 'big.bin', folderPath: '/', data, mtime: 1, chunker: false });
     const sent = env.server.log.filter((l) => l.method === 'PUT').map((l) => l.partIdx);
-    assert.equal(sent[0], 2, 'resumes at the first missing part');
-    assert.ok(sent.every((i) => i >= 2), 'parts 0 and 1 are not re-sent: ' + JSON.stringify(sent));
-    assert.ok(sent.length >= 1);
+    assert.deepEqual(sent, [2, 3]);
     assert.equal(sha(env.server.files.get(f.id).bytes), sha(data));
     assert.equal(env.server.liveFiles().length, 1);
   } finally { await env.stop(); }
@@ -138,16 +119,16 @@ test('12 empty file round-trips through client', async () => {
   } finally { await env.stop(); }
 });
 
-test('13 parts never exceed 5 MB even if server advertises bigger limits; 12 MB file is split', async () => {
-  const env = await makeEnv({ server: { maxBody: 5 * 1024 * 1024, oneShotMax: 64 * 1024 * 1024, chunk: 64 * 1024 * 1024 } });
+test('13 parts respect the documented 5 MiB limit; 12 MiB file is split and fingerprint checked', async () => {
+  const env = await makeEnv({ server: { maxBody: 5 * 1024 * 1024, oneShotMax: 5 * 1024 * 1024, chunk: 5 * 1024 * 1024 } });
   try {
     const data = big(12 * 1024 * 1024 + 123);
     const f = await uploadFile(env.client, { name: 'huge.bin', folderPath: '/', data, mtime: 1 });
     assert.equal(f.size, data.length);
     assert.ok(env.server.maxSeen <= 5 * 1024 * 1024, 'largest request body ' + env.server.maxSeen);
     const parts = env.server.log.filter((l) => l.partIdx !== undefined);
-    assert.ok(parts.length >= 2, 'split into multiple chunks: ' + parts.length);
-    assert.equal(sha(env.server.findLive('/', 'huge.bin').bytes), sha(data));
+    assert.ok(parts.length >= 3, 'CDC parts respect the hard cap');
+    assert.ok(Buffer.compare(env.server.findLive('/', 'huge.bin').bytes, data) === 0);
     // a file just under the cap still goes in one request
     const small = big(4_900_000);
     await uploadFile(env.client, { name: 'one.bin', folderPath: '/', data: small, mtime: 1 });

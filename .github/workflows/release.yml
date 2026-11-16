@@ -16,10 +16,9 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-      - run: npm run build
+      - name: Build bundle and safe installation zip
+        run: npm run package
       - run: npm test
-      - name: Build installable zip
-        run: npm run zip
       - name: Check tag matches manifest version
         run: |
           V=$(node -p "require('./manifest.json').version")
@@ -34,5 +33,5 @@ jobs:
             main.js
             manifest.json
             styles.css
-            tdrive-sync-*.zip
+            tdrive-sync.zip
           generate_release_notes: true

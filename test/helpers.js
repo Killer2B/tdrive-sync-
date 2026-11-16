@@ -3,6 +3,7 @@ const { createMockServer } = require('./mockServer');
 const { TdriveClient } = require('../src/TdriveClient');
 const { ManifestStore } = require('../src/ManifestStore');
 const { SyncEngine } = require('../src/SyncEngine');
+const { fetchManifest, downloadChangedRanges } = require('../src/DownloadManager');
 
 async function nodeTransport({ url, method, headers, body }) {
   const r = await fetch(url, { method, headers, body });
@@ -20,23 +21,6 @@ class MemFS {
   async listFolders() { return [...this.dirs]; }
   async readBinary(p) { const f = this.files.get(p); if (!f) throw new Error('ENOENT ' + p); return f.data.buffer.slice(f.data.byteOffset, f.data.byteOffset + f.data.length); }
   async writeBinary(p, buf) { this.put(p, buf); }
-  async appendBinary(p, buf) {
-    const prev = this.files.get(p);
-    const add = Buffer.from(buf);
-    const merged = prev ? Buffer.concat([prev.data, add]) : add;
-    this.files.set(p, { data: merged, mtime: ++this.clock });
-  }
-  get canStream() { return true; }
-  async beginStreamWrite(p) {
-    let n = 0;
-    return {
-      write: async (chunk) => {
-        const b = chunk instanceof ArrayBuffer ? Buffer.from(chunk) : Buffer.from(chunk.buffer ? chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength) : chunk);
-        if (n++ === 0) this.put(p, b); else await this.appendBinary(p, b);
-      },
-      close: async () => p,
-    };
-  }
   async stat(p) { const f = this.files.get(p); return f ? { size: f.data.length, mtime: f.mtime } : null; }
   async exists(p) { return this.files.has(p) || this.dirs.has(p); }
   async trash(p) { this.trashed.push({ path: p, data: this.files.get(p).data }); this.files.delete(p); }   // empty parent folders stay
@@ -45,11 +29,12 @@ class MemFS {
 }
 
 async function makeEnv(o = {}) {
-  const server = await createMockServer(o.server).start();
+  // Existing small-part scenarios are explicit, independent of the API fixture's 5 MiB default.
+  const server = await createMockServer({ oneShotMax: 1024 * 1024, chunk: 1024 * 1024, legacyFeatures: !!o.legacyFeatures, ...(o.server || {}) }).start();
   const sleeps = [];
   const settings = {
     baseUrl: server.url, remoteFolder: '/Vault/', mode: 'two-way', deletionPolicy: 'trash', maxDeletesPerRun: 10,
-    excludePatterns: [], downloadChunkBytes: 64 * 1024, remoteLock: false, ...(o.settings || {}),
+    excludePatterns: [], downloadChunkBytes: 64 * 1024, remoteLock: false, cdcFiles: !!o.legacyFeatures, dedupeUploads: !!o.legacyFeatures, ...(o.settings || {}),
   };
   const mkClient = (key, extra) => new TdriveClient({ baseUrl: server.url, apiKey: key || server.key, transport: nodeTransport, allowInsecure: true, sleep: async (ms) => { sleeps.push(ms); }, maxRetries: 4, ...(o.client || {}), ...(extra || {}) });
   const mkDevice = (device = {}) => {
@@ -57,7 +42,8 @@ async function makeEnv(o = {}) {
     let blob = null;
     const manifest = device.manifest || new ManifestStore({ read: async () => blob, write: async (s) => { blob = s; } });
     const client = device.client || mkClient();
-    const engine = new SyncEngine({ client, local, manifest, getSettings: () => settings, ...(device.engine || {}) });
+    const engine = new SyncEngine({ client, local, manifest, getSettings: () => settings,
+      ...(o.legacyFeatures ? { manifestFn: fetchManifest, deltaFn: downloadChangedRanges } : {}), ...(device.engine || {}) });
     return { local, manifest, client, engine };
   };
   return { server, settings, sleeps, mkClient, mkDevice, ...mkDevice(), stop: () => server.stop() };

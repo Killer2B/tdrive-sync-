@@ -3,7 +3,8 @@
 // conflict-copy isolation, selective sync, dry-run, adaptive concurrency.
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { makeEnv } = require('./helpers');
+const { makeEnv: makeBaseEnv } = require('./helpers');
+const makeEnv = (opts = {}) => makeBaseEnv({ legacyFeatures: true, ...opts });
 const { sha } = require('./mockServer');
 
 const buf = (s) => new TextEncoder().encode(s).buffer;
@@ -227,7 +228,7 @@ test('a 429 lowers the concurrency hint used for parallel parts', async () => {
 
 // ---------- 2. incremental remote scan ----------
 
-test('an unchanged remote reuses the cached listing (no tree walk)', async () => {
+test('an equal activity timestamp forces a safe scan without transferring unchanged content', async () => {
   const env = await makeEnv();
   try {
     env.local.put('a.md', 'a'); env.local.put('Notes/b.md', 'b');
@@ -235,12 +236,18 @@ test('an unchanged remote reuses the cached listing (no tree walk)', async () =>
     assert.equal(r1.uploaded, 2, JSON.stringify(r1));
     const r0 = await env.engine.syncNow();                     // establishes the snapshot (nothing changes)
     assert.equal(r0.uploaded + r0.downloaded, 0);
+    const snapshot = env.manifest.data.meta.remoteSnapshot;
+    assert.ok(Number.isFinite(snapshot.activityAt), 'a real server activity cursor was saved');
+    assert.equal(Date.parse(env.server.activity.at(-1).created_at), snapshot.activityAt, 'the server returns an event equal to the cursor');
     env.server.log.length = 0;
     const r2 = await env.engine.syncNow();
-    assert.equal(env.engine._snapshotUsed, true, 'a later run reused the snapshot');
+    assert.equal(env.engine._snapshotUsed, false, 'equal timestamps cannot prove no concurrent remote changes');
     const walks = env.server.log.filter((l) => l.method === 'GET' && l.route === '/files').length;
-    assert.ok(walks <= 1, 'no recursive folder walk, saw ' + walks);
+    assert.ok(walks >= 2, 'the safe scan walked the root and Notes folder');
     assert.equal(r2.uploaded + r2.downloaded, 0);
+    assert.equal(r2.status, 'ok', JSON.stringify(r2));
+    assert.equal(env.local.text('a.md'), 'a');
+    assert.equal(env.local.text('Notes/b.md'), 'b');
   } finally { await env.stop(); }
 });
 
@@ -272,21 +279,25 @@ test('incrementalScan disabled always walks the tree', async () => {
 
 // ---------- 15. stream large downloads to disk ----------
 
-test('a large download streams to disk and stays consistent (no re-download next run)', async () => {
+test('a large download verifies the full plaintext hash before baseline publication and never retransfers unchanged content', async () => {
   const env = await makeEnv({ settings: { streamThresholdBytes: 1024 * 1024 } });
   try {
     const big = Buffer.alloc(3 * 1024 * 1024 + 5); for (let i = 0; i < big.length; i++) big[i] = (i * 7 + 3) & 255;
-    env.server.addFile('/Vault/', 'movie.bin', big);
+    const rec = env.server.addFile('/Vault/', 'movie.bin', big);
     const r = await env.engine.syncNow();
     assert.equal(r.downloaded, 1, JSON.stringify(r));
     assert.ok(env.local.files.has('movie.bin'), 'written to disk');
     assert.equal(env.local.files.get('movie.bin').data.length, big.length, 'full size on disk');
+    assert.deepEqual(env.local.files.get('movie.bin').data, big, 'all plaintext bytes match');
     const entry = env.manifest.getFile('movie.bin');
-    assert.equal(entry.localHash, null, 'hash deferred for streamed download');
-    // next run: no re-download, and the hash is now filled in without being treated as a change
+    assert.equal(entry.localHash, sha(big), 'the full plaintext hash is verified before the baseline is recorded');
+    assert.equal(entry.remoteId, rec.id);
+    env.server.log.length = 0;
     const r2 = await env.engine.syncNow();
     assert.equal(r2.uploaded + r2.downloaded, 0, JSON.stringify(r2));
-    assert.ok(env.manifest.getFile('movie.bin').localHash, 'hash computed lazily');
+    assert.equal(env.manifest.getFile('movie.bin').localHash, sha(big));
+    assert.equal(env.manifest.getFile('movie.bin').remoteId, rec.id);
+    assert.equal(env.server.log.filter((r) => /\/content$|\/parts\//.test(r.route)).length, 0, 'no subsequent content transfer');
   } finally { await env.stop(); }
 });
 

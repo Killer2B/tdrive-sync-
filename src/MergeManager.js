@@ -16,6 +16,7 @@ function lcsMatch(a, b) {
   const an = n - s; const bn = m - s;
   if (an > p && bn > p) {
     const rows = an - p; const cols = bn - p;
+    if ((rows + 1) * (cols + 1) > 1000000) throw new Error('Text merge exceeds the safe work limit; resolve this conflict manually');
     const dp = Array.from({ length: rows + 1 }, () => new Int32Array(cols + 1));
     for (let i = rows - 1; i >= 0; i--) {
       for (let j = cols - 1; j >= 0; j--) {

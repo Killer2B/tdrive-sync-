@@ -24,4 +24,10 @@
 .tdrive-conflict-preview { display: flex; gap: 10px; margin: 8px 0; }
 .tdrive-conflict-preview .tdrive-conflict-col { flex: 1 1 0; min-width: 0; }
 .tdrive-conflict-preview h5 { margin: 0 0 4px; font-size: 0.85em; opacity: 0.8; }
-.tdrive-conflict-preview pre { max-height: 40vh; overflow: auto; margin: 0; }
+.tdrive-conflict-preview pre { max-height: 40vh; overflow: auto; margin: 0; min-width: 0; }
+.tdrive-conflict-result { white-space: pre-wrap; overflow-wrap: anywhere; }
+.tdrive-sync-view button { min-height: 36px; }
+@media (max-width: 600px) {
+  .tdrive-conflict-preview { flex-direction: column; }
+  .tdrive-sync-view button { min-height: 44px; }
+}

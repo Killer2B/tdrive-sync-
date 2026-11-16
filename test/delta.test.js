@@ -3,7 +3,8 @@
 // changed byte ranges are fetched. Falls back to a full download whenever a delta is not worthwhile.
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { makeEnv, nodeTransport } = require('./helpers');
+const { makeEnv: makeBaseEnv } = require('./helpers');
+const makeEnv = (opts = {}) => makeBaseEnv({ legacyFeatures: true, ...opts });
 
 const body = (bytes, seed = 1) => {
   const b = Buffer.alloc(bytes); let s = seed >>> 0;

@@ -22,20 +22,20 @@ const MAX_CDC_MAX = 5242880;   // a chunk may never exceed the server's part cap
  *  bigger chunks (fewer requests). Both sides read the same params from the manifest, so any choice is consistent.
  *  Chunk counts are kept well under MAX_MAP_CHUNKS so the map stays small in the ledger. */
 function chooseChunker(size, maxChunk) {
-  if (size <= 256 * 1024) return { algo: 'buzhash', min: 1024, avg: 2048, max: 4096, window: 48 };
-  if (size <= 16 * 1024 * 1024) return { algo: 'buzhash', min: 16 * 1024, avg: 64 * 1024, max: 256 * 1024, window: 48 };
-  if (size <= 256 * 1024 * 1024) return { algo: 'buzhash', min: 64 * 1024, avg: 512 * 1024, max: 2 * 1024 * 1024, window: 64 };
-  const max = Math.min(Number.isFinite(maxChunk) && maxChunk > 0 ? maxChunk : MAX_CDC_MAX, MAX_CDC_MAX);
-  return { algo: 'buzhash', min: 256 * 1024, avg: Math.min(2 * 1024 * 1024, Math.floor(max / 2)), max, window: 96 };
+  const cap = maxChunk == null ? MAX_CDC_MAX : maxChunk;
+  if (!Number.isSafeInteger(cap) || cap < 1024) throw new Error('Server chunk size cannot support CDC');
+  const values = size <= 256 * 1024 ? [1024, 2048, 4096, 48]
+    : size <= 16 * 1024 * 1024 ? [16 * 1024, 64 * 1024, 256 * 1024, 48]
+      : size <= 256 * 1024 * 1024 ? [64 * 1024, 512 * 1024, 2 * 1024 * 1024, 64]
+        : [256 * 1024, 2 * 1024 * 1024, cap, 96];
+  return { algo: 'buzhash', min: Math.min(values[0], cap), avg: Math.min(values[1], cap), max: Math.min(values[2], cap), window: values[3] };
 }
 
 /** Plausible CDC params (clamped to the API bounds) or null if the object is not a usable chunker. */
-function normalizeChunker(ch) {
+function normalizeChunker(ch, maxChunk = MAX_CDC_MAX) {
   if (!ch || ch.algo !== 'buzhash') return null;
-  const min = Math.max(CDC_BOUNDS.minMin, ch.min | 0);
-  const avg = Math.max(min, ch.avg | 0);
-  const max = Math.max(avg, ch.max | 0);
-  const window = Math.min(CDC_BOUNDS.windowMax, Math.max(CDC_BOUNDS.windowMin, ch.window | 0));
+  const { min, avg, max, window } = ch;
+  if (![min, avg, max, window].every(Number.isSafeInteger) || min < 1024 || avg < min || max < avg || max > maxChunk || window < 16 || window > 256) return null;
   return { algo: 'buzhash', min, avg, max, window };
 }
 
@@ -58,6 +58,7 @@ function cdc(bytes, ch) {
 
 /** Fixed-size plan (used when the server chunked an object that way, e.g. a one-shot upload). */
 function fixed(size, chunkSize) {
+  if (!Number.isSafeInteger(size) || size < 0 || !Number.isSafeInteger(chunkSize) || chunkSize <= 0) throw new Error('Invalid fixed chunk plan');
   const out = [];
   for (let o = 0; o < size; o += chunkSize) out.push({ offset: o, size: Math.min(chunkSize, size - o) });
   if (out.length === 0) out.push({ offset: 0, size: 0 });

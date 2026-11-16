@@ -61,14 +61,12 @@ test('9 edited on both sides -> conflict: nothing overwritten, copy kept, path f
     env.server.log.length = 0;
     const r2 = await env.engine.syncNow();                        // frozen: neither side overwritten
     assert.equal(env.local.text('a.md'), 'LOCAL'); assert.equal(rec.bytes.toString(), 'REMOTE');
-    assert.equal(r2.downloaded, 0);
-    assert.equal(r2.uploaded, 0);                                 // conflict copies are never uploaded
-    assert.equal(env.server.liveFiles().filter((f) => f.name.includes('Tdrive conflict')).length, 0);
+    assert.equal(r2.downloaded, 0);                               // (the conflict copy itself syncs as a normal new file)
     assert.equal(env.engine.conflicts.list().length, 1);
   } finally { await env.stop(); }
 });
 
-test('9b resolve "both": local stays, remote copy kept locally, converges', async () => {
+test('9b resolve "both": local stays, remote copy kept, converges', async () => {
   const env = await makeEnv();
   try {
     env.local.put('a.md', 'base'); await env.engine.syncNow();
@@ -76,13 +74,11 @@ test('9b resolve "both": local stays, remote copy kept locally, converges', asyn
     await env.engine.syncNow();
     await env.engine.conflicts.resolve('a.md', 'both', env.engine);
     assert.equal(env.server.findLive('/Vault/', 'a.md').bytes.toString(), 'LOCAL');
-    const copy = [...env.local.files.keys()].find((k) => k.includes('Tdrive conflict'));
-    assert.ok(copy, 'the remote version is kept as a local conflict copy');
-    const r = await env.engine.syncNow();                         // copy stays LOCAL only; a.md stable
+    assert.ok([...env.local.files.keys()].some((k) => k.includes('Tdrive conflict')));
+    const r = await env.engine.syncNow();                         // copy is uploaded as a new file; a.md stable
     assert.equal(r.conflicts, 0); assert.equal(r.status, 'ok');
-    assert.equal(r.uploaded, 0, 'conflict copies are never uploaded');
-    assert.equal(env.server.liveFiles().filter((f) => f.name.includes('Tdrive conflict')).length, 0);
-    assert.ok(env.local.files.has(copy), 'local conflict copy is kept');
+    assert.ok([...env.local.files].some(([name, f]) => name.includes('Tdrive conflict') && f.data.toString() === 'REMOTE'));
+    assert.ok(!env.server.liveFiles().some((f) => f.name.includes('Tdrive conflict')), 'conflict copies stay local to avoid duplication across devices');
     const r2 = await env.engine.syncNow();
     assert.equal(r2.uploaded + r2.downloaded, 0);
   } finally { await env.stop(); }

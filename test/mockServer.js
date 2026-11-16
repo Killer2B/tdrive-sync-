@@ -1,6 +1,5 @@
 'use strict';
-// In-process fake Tdrive. It implements the documented endpoint list with *assumed* JSON shapes
-// (the public docs do not give them). It tests our logic, NOT the real server.
+// In-process Tdrive contract server. Alternative legacy listing shapes remain explicit fixtures.
 const http = require('http');
 const crypto = require('crypto');
 
@@ -10,23 +9,37 @@ const normFolder = (p) => { p = p || '/'; if (!p.startsWith('/')) p = '/' + p; i
 function createMockServer(opts = {}) {
   const st = {
     key: 'tdk_testkey1234567890', files: new Map(), folders: new Set(['/']), uploads: new Map(), idem: new Map(),
-    chunkStore: new Map(), noRevisions: !!opts.noRevisions,
     nextId: 1, clock: 1_700_000_000_000, log: [], rules: [],
     dup: opts.dup || 'allow', requireFolders: opts.requireFolders !== false,
     maxBody: opts.maxBody || 0, maxSeen: 0,
     folderShape: opts.folderShape || 'default', hideSubfolderFiles: !!opts.hideSubfolderFiles, dupFolders: !!opts.dupFolders,
-    folderDelete: opts.folderDelete || 'any',   // 'any' | 'byPath' (only DELETE /folders?path=) | 'none' (405)
-    oneShotMax: opts.oneShotMax || 1024 * 1024, chunk: opts.chunk || 1024 * 1024,
+    folderDelete: opts.folderDelete || 'any',
+    oneShotMax: opts.oneShotMax || 5242880, chunk: opts.chunk || 5242880,
+    legacyFeatures: !!opts.legacyFeatures, chunkManifests: opts.chunkManifests !== false,
+    noRevisions: !!opts.noRevisions, chunkStore: new Map(), activity: [], faultHits: {},
   };
   const tick = () => (st.clock += 1000);
-  // The part size a session actually enforces: the advertised chunk, capped by any hard request-body limit.
-  const effChunk = () => (st.maxBody ? Math.min(st.chunk, st.maxBody) : st.chunk);
-  const fileJson = (f) => ({ id: f.id, name: f.name, path: f.path, size: (st.listingSizeOverride && st.listingSizeOverride[f.id] != null) ? st.listingSizeOverride[f.id] : f.bytes.length, lastModified: f.lastModified, trashed: f.trashed });
+  const fileJson = (f, listing = false) => ({ id: f.id, name: f.name, path: f.path,
+    size: listing && st.listingSizeOverride && st.listingSizeOverride[f.id] != null ? st.listingSizeOverride[f.id] : f.bytes.length,
+    lastModified: f.lastModified, trashed: f.trashed,
+    ...(st.legacyFeatures ? { contentVersion: f.version || 1, etag: etagOf(f), checksum: fingerprintOf(f) } : {}) });
   const live = () => [...st.files.values()].filter((f) => !f.trashed);
-  // Activity recorded by requests during a sync must look OLDER than the engine's snapshot stamp; activity
-  // simulating another device (the helpers below) must look NEWER. The fake clock is far in the past.
-  const note = (action, target, at) => { st.activity.push({ action, target, detail: '{}', created_at: new Date(at || st.clock).toISOString() }); };
-  const noteExternal = (action, target) => note(action, target, Date.now() + 1000);
+  const note = (action, target) => { if (st.legacyFeatures) st.activity.push({ action, target, detail: '{}', created_at: new Date(tick()).toISOString() }); };
+  const hit = (fault) => { st.faultHits[fault] = (st.faultHits[fault] || 0) + 1; };
+  function planOf(f) {
+    if (f.chunks) return f.chunks;
+    return [...Array(Math.max(1, Math.ceil(f.bytes.length / st.chunk))).keys()].map((idx) => {
+      const offset = idx * st.chunk; const bytes = f.bytes.subarray(offset, offset + st.chunk);
+      return { idx, offset, size: bytes.length, checksum: sha(bytes) };
+    });
+  }
+  const fingerprintOf = (f) => sha(planOf(f).map((c) => c.checksum).join('\n'));
+  const etagOf = (f) => 'manifest-' + fingerprintOf(f);
+  function storePlan(f) { if (st.legacyFeatures) for (const c of planOf(f)) st.chunkStore.set(c.checksum, Buffer.from(f.bytes.subarray(c.offset, c.offset + c.size))); }
+  function replaceFile(f, bytes, chunks, chunker) {
+    if (st.legacyFeatures) { (f.versions || (f.versions = [])).push({ version: f.version || 1, bytes: Buffer.from(f.bytes) }); f.version = (f.version || 1) + 1; }
+    f.bytes = Buffer.from(bytes); f.chunks = chunks || null; f.chunker = chunker || null; f.lastModified = tick(); storePlan(f); note('revision', f.id);
+  }
 
   function addFolder(p) { p = normFolder(p); const parts = p.split('/').filter(Boolean); let cur = '/'; for (const s of parts) { cur += s + '/'; st.folders.add(cur); } }
   function createFile(name, path, bytes, lastModified) {
@@ -39,43 +52,17 @@ function createMockServer(opts = {}) {
       name = `${base} (${n})${ext}`;
     }
     const f = { id: 'f' + st.nextId++, name, path, bytes: Buffer.from(bytes), lastModified: lastModified || tick(), trashed: false };
-    st.files.set(f.id, f); storeChunks(f.bytes); return { f };
+    st.files.set(f.id, f); storePlan(f); note('upload', f.id); return { f };
   }
-  // Every stored (non-empty) chunk is indexed by its SHA-256, so a later revision can reuse it without bytes.
-  function storeChunks(buf) {
-    const size = effChunk();
-    if (buf.length === 0) return;
-    for (let o = 0; o < buf.length; o += size) {
-      const p = buf.subarray(o, Math.min(o + size, buf.length));
-      if (p.length) st.chunkStore.set(sha(p), Buffer.from(p));
-    }
-  }
-  function chunkRows(file, size) {
-    const out = []; const n = Math.max(1, Math.ceil(file.bytes.length / size));
-    for (let i = 0; i < n; i++) {
-      const p = file.bytes.subarray(i * size, Math.min((i + 1) * size, file.bytes.length));
-      out.push({ idx: i, offset: i * size, size: p.length, checksum: sha(p) });
-    }
-    return out;
-  }
-  // A file's chunk plan: the client's (CDC) plan when it provided one, else a fixed-size plan.
-  function planOf(f) {
-    if (f.chunks && f.chunks.length) return f.chunks;
-    return chunkRows(f, effChunk());
-  }
-  const etagOf = (f) => 'manifest-' + sha(planOf(f).map((c) => c.checksum).join('\n'));
-  const versionOf = (f) => f.version || 1;
-  st.addFile = (path, name, data) => { addFolder(path); const f = createFile(name, path, Buffer.from(data)).f; noteExternal('upload', f.id); return f; };
-  st.modifyFile = (id, data) => { const f = st.files.get(id); f.bytes = Buffer.from(data); f.lastModified = tick(); noteExternal('update', id); return f; };
-  st.removeFile = (id) => { st.files.get(id).trashed = true; noteExternal('trash', id); };
-  st.removeFile = (id) => { st.files.get(id).trashed = true; noteExternal('trash', id); };
+  st.addFile = (path, name, data) => { addFolder(path); return createFile(name, path, Buffer.from(data)).f; };
+  st.modifyFile = (id, data) => { const f = st.files.get(id); replaceFile(f, data); return f; };
+  st.removeFile = (id) => { st.files.get(id).trashed = true; note('trash', id); };
   st.findLive = (path, name) => live().find((f) => f.path === normFolder(path) && f.name === name);
   st.liveFiles = live;
   st.failRule = (match, action, times = 1) => st.rules.push({ match, action, times });
-  st.removeFolder = (p) => { p = normFolder(p); for (const f of [...st.folders]) if (f.startsWith(p)) st.folders.delete(f); for (const f of st.files.values()) if (f.path.startsWith(p)) f.trashed = true; noteExternal('move', p); };
+  st.removeFolder = (p) => { p = normFolder(p); for (const f of [...st.folders]) if (f.startsWith(p)) st.folders.delete(f); for (const f of st.files.values()) if (f.path.startsWith(p)) f.trashed = true; };
   st.opsLog = () => st.log.filter((l) => l.method !== 'GET');
-  st.activity = [];
-  st.addActivity = (action, target, detail) => noteExternal(action, target);
+  st.addActivity = (action, target) => note(action, target);
 
   const send = (res, status, body, headers = {}) => {
     const buf = Buffer.isBuffer(body) ? body : Buffer.from(JSON.stringify(body));
@@ -89,7 +76,6 @@ function createMockServer(opts = {}) {
     const chunks = []; for await (const c of req) chunks.push(c);
     const body = Buffer.concat(chunks);
     const u = new URL(req.url, 'http://x');
-    let mm;
     const route = u.pathname.replace(/^\/api\/v1/, '') || '';
     const partM = /^\/uploads\/([^/]+)\/parts\/(\d+)$/.exec(route);
     const info = { method: req.method, route, query: Object.fromEntries(u.searchParams), range: req.headers.range, partIdx: partM ? Number(partM[2]) : undefined, name: u.searchParams.get('name') };
@@ -108,40 +94,47 @@ function createMockServer(opts = {}) {
     try {
       if (route === '' && m === 'GET') return ok(res, { upload: { oneShotMaxBytes: st.oneShotMax, chunkBytes: st.chunk } });
       if (route === '/me') return ok(res, { name: 'tester' });
-      if (route === '/activity') return ok(res, { activity: st.activity, nextOffset: null });
-      if (route === '/search' && m === 'GET') {
+      if (st.legacyFeatures && route === '/activity' && m === 'GET') return ok(res, { activity: st.activity.slice(-50).reverse(), nextOffset: null });
+      if (st.legacyFeatures && route === '/search' && m === 'GET') {
         const q = (u.searchParams.get('q') || '').toLowerCase();
-        const files = live().filter((f) => String(f.name).toLowerCase().includes(q)).map((f) => fileJson(f));
-        return ok(res, { files, limit: 200, offset: 0, nextOffset: null });
+        return ok(res, { files: live().filter((f) => f.name.toLowerCase().includes(q)).map((f) => fileJson(f)), nextOffset: null });
       }
-      if (route === '/chunks/lookup' && m === 'POST') {
-        const j = JSON.parse(body.toString());
-        const available = (j.checksums || []).filter((h) => st.chunkStore.has(h));
-        return ok(res, { available, chunkBytes: effChunk() });
+      if (st.legacyFeatures && route === '/chunks/lookup' && m === 'POST') {
+        const j = JSON.parse(body.toString()); return ok(res, { available: (j.checksums || []).filter((h) => st.chunkStore.has(h)), chunkBytes: st.chunk });
       }
-      if ((mm = /^\/files\/([^/]+)\/shares$/.exec(route)) && m === 'POST') {
-        const f = st.files.get(mm[1]); if (!f) return fail(res, 404, 'not_found', 'nope');
+      let featureMatch;
+      if (st.legacyFeatures && (featureMatch = /^\/files\/([^/]+)\/shares$/.exec(route)) && m === 'POST') {
+        if (!st.files.has(featureMatch[1])) return fail(res, 404, 'not_found', 'no file');
         const token = 'sh' + st.nextId++; return ok(res, { token, url: st.url + '/s/' + token, permission: 'download' }, 201);
       }
-      if ((mm = /^\/files\/([^/]+)\/versions$/.exec(route)) && m === 'GET') {
-        const f = st.files.get(mm[1]); if (!f) return fail(res, 404, 'not_found', 'nope');
-        const versions = (f.versions || []).map((v, i) => ({ id: 'v' + (i + 1), version: v.version || (i + 1), size: v.bytes.length, created_at: new Date(st.clock).toISOString() })).reverse();
-        return ok(res, { versions });
+      if (st.legacyFeatures && (featureMatch = /^\/files\/([^/]+)\/versions$/.exec(route)) && m === 'GET') {
+        const f = st.files.get(featureMatch[1]); if (!f) return fail(res, 404, 'not_found', 'no file');
+        return ok(res, { versions: (f.versions || []).map((v, i) => ({ id: 'v' + (i + 1), version: v.version, size: v.bytes.length })).reverse() });
       }
-      if ((mm = /^\/files\/([^/]+)\/versions\/([^/]+)\/restore$/.exec(route)) && m === 'POST') {
-        const f = st.files.get(mm[1]); if (!f) return fail(res, 404, 'not_found', 'nope');
-        const idx = Number(String(mm[2]).replace(/\D/g, '')) - 1;
-        const v = (f.versions || [])[idx];
-        if (!v) return fail(res, 404, 'not_found', 'no version');
-        f.versions = f.versions || []; f.versions.push({ version: (f.version || 1) + 1, bytes: f.bytes });
-        f.bytes = Buffer.from(v.bytes); f.version = (f.version || 1) + 1; f.chunks = null; note('restore', f.id);
-        return ok(res, {});
+      if (st.legacyFeatures && (featureMatch = /^\/files\/([^/]+)\/versions\/v(\d+)\/restore$/.exec(route)) && m === 'POST') {
+        const f = st.files.get(featureMatch[1]); const v = f && (f.versions || [])[Number(featureMatch[2]) - 1];
+        if (!v) return fail(res, 404, 'not_found', 'no version'); replaceFile(f, v.bytes); return ok(res, { file: fileJson(f) });
+      }
+      if (st.legacyFeatures && (featureMatch = /^\/files\/([^/]+)\/(chunks|delta)$/.exec(route))) {
+        const f = st.files.get(featureMatch[1]); if (!f) return fail(res, 404, 'not_found', 'no file');
+        const chunks = planOf(f); const etag = etagOf(f);
+        const manifest = { id: f.id, size: f.bytes.length, contentVersion: f.version || 1, etag, checksum: fingerprintOf(f), chunker: f.chunker || null, chunkSize: st.chunk, totalChunks: chunks.length, chunks };
+        if (featureMatch[2] === 'chunks' && m === 'GET') {
+          if (!st.chunkManifests) return fail(res, 404, 'not_found', 'chunk manifests unavailable');
+          if (req.headers['if-none-match'] === etag) { res.writeHead(304, { ETag: etag }); return res.end(); }
+          return ok(res, manifest);
+        }
+        if (featureMatch[2] === 'delta' && m === 'POST') {
+          const mine = new Set(JSON.parse(body.toString()).checksums || []); const changed = chunks.filter((c) => !mine.has(c.checksum));
+          const changedRanges = []; for (const c of changed) { const last = changedRanges[changedRanges.length - 1]; if (last && last[0] + last[1] === c.offset) last[1] += c.size; else changedRanges.push([c.offset, c.size]); }
+          return ok(res, { ...manifest, changed, changedRanges, unchanged: chunks.filter((c) => mine.has(c.checksum)).map((c) => c.checksum), checksums: chunks.map((c) => c.checksum) });
+        }
       }
       if (route === '/files' && m === 'GET') {
         const p = normFolder(u.searchParams.get('path'));
         if (!st.folders.has(p) && p !== '/') return fail(res, 404, 'not_found', 'no such folder');
         const depth = p.split('/').filter(Boolean).length;
-        const files = live().filter((f) => f.path === p).filter(() => !(st.hideSubfolderFiles && depth > 1)).map(fileJson);
+        const files = live().filter((f) => f.path === p).filter(() => !(st.hideSubfolderFiles && depth > 1)).map((f) => fileJson(f, true));
         const subs = [...st.folders].filter((f) => f !== p && f.startsWith(p) && f.slice(p.length).split('/').filter(Boolean).length === 1);
         const shape = {
           default: (f) => ({ id: 'd' + f, name: f.slice(p.length, -1), type: 'folder' }),
@@ -166,108 +159,59 @@ function createMockServer(opts = {}) {
         const r = createFile(u.searchParams.get('name'), path, body);
         if (r.err) return fail(res, ...r.err);
         if (key) st.idem.set(key, r.f.id);
-        note('upload', r.f.id);
         return ok(res, fileJson(r.f), 201);
       }
-
-      if ((mm = /^\/files\/([^/]+)\/chunks$/.exec(route)) && m === 'GET') {
-        const f = st.files.get(mm[1]); if (!f) return fail(res, 404, 'not_found', 'nope');
-        const etag = etagOf(f);
-        if (req.headers['if-none-match'] === etag) return send(res, 304, '');
-        const chunks = planOf(f);
-        return ok(res, { id: f.id, name: f.name, path: f.path, size: f.bytes.length, version: versionOf(f), etag, chunker: f.chunker || null, chunkSize: effChunk(), totalChunks: chunks.length, chunks });
-      }
-      if ((mm = /^\/files\/([^/]+)\/delta$/.exec(route)) && m === 'POST') {
-        const f = st.files.get(mm[1]); if (!f) return fail(res, 404, 'not_found', 'nope');
-        const j = JSON.parse(body.toString());
-        const mine = new Set(j.checksums || []);
-        const chunks = planOf(f);
-        const changed = chunks.filter((c) => !mine.has(c.checksum));
-        const changedRanges = []; for (const c of changed) { const last = changedRanges[changedRanges.length - 1]; if (last && last[0] + last[1] === c.offset) last[1] += c.size; else changedRanges.push([c.offset, c.size]); }
-        return ok(res, { version: versionOf(f), etag: etagOf(f), size: f.bytes.length, chunkSize: effChunk(), chunker: f.chunker || null, totalChunks: chunks.length, unchanged: chunks.filter((c) => mine.has(c.checksum)).map((c) => c.checksum), changed, changedRanges, checksums: chunks.map((c) => c.checksum) });
-      }
+      let mm;
       if ((mm = /^\/files\/([^/]+)\/content$/.exec(route)) && m === 'GET') {
         const f = st.files.get(mm[1]); if (!f) return fail(res, 404, 'not_found', 'nope');
-        const etag = etagOf(f);
-        if (req.headers['if-none-match'] === etag) return send(res, 304, '', { ETag: etag });
-        if (st.busyFirst && st.busyFirst > 0) { st.busyFirst--; return fail(res, 503, 'Busy', 'try later'); }
-        // Serve a DIFFERENT (wrong) object for the content, while /chunks still describes the real file.
-        if (st.contentOverride) {
-          const w = st.contentOverride;
-          const rg0 = /bytes=(\d+)-(\d*)/.exec(req.headers.range || '');
-          if (!rg0) return send(res, 200, w, { ETag: etag });
-          const a0 = Number(rg0[1]); const b0 = Math.min(rg0[2] ? Number(rg0[2]) : w.length - 1, w.length - 1);
-          if (a0 >= w.length) return send(res, 416, '', { 'Content-Range': `bytes */${w.length}`, ETag: etag });
-          return send(res, 206, w.subarray(a0, b0 + 1), { 'Content-Range': `bytes ${a0}-${b0}/${w.length}`, ETag: etag });
-        }
+        const headers = st.legacyFeatures ? { ETag: etagOf(f) } : {};
+        if (st.legacyFeatures && st.busyFirst > 0) { st.busyFirst--; hit('busyFirst'); return fail(res, 503, 'Busy', 'try later'); }
+        const bytes = st.legacyFeatures && st.contentOverride ? st.contentOverride : f.bytes;
+        if (bytes !== f.bytes) hit('contentOverride');
         const rg = /bytes=(\d+)-(\d*)/.exec(req.headers.range || '');
-        if (!rg) {
-          if (st.corruptContent) {
-            const body = Buffer.from(f.bytes);
-            if (body.length) body[0] ^= 0xff;
-            return send(res, 200, body, { ETag: etag });
-          }
-          return send(res, 200, f.bytes, { ETag: etag });
+        const a = rg ? Number(rg[1]) : 0; const b = rg ? Math.min(rg[2] ? Number(rg[2]) : bytes.length - 1, bytes.length - 1) : bytes.length - 1;
+        if (rg && a >= bytes.length) return send(res, 416, Buffer.alloc(0), { 'Content-Range': `bytes */${bytes.length}`, ...headers });
+        if (st.legacyFeatures && rg && st.contentTruncate && st.contentTruncate.times > 0) {
+          st.contentTruncate.times--; hit('contentTruncate');
+          return send(res, 206, bytes.subarray(a, Math.min(a + st.contentTruncate.at, b + 1)), { 'Content-Range': `bytes ${a}-${b}/${bytes.length}`, ...headers });
         }
-        const a = Number(rg[1]); const b = Math.min(rg[2] ? Number(rg[2]) : f.bytes.length - 1, f.bytes.length - 1);
-        if (a >= f.bytes.length) {
-          // RFC 7233: range past EOF -> 416 with the authoritative total, no body.
-          return send(res, 416, '', { 'Content-Range': `bytes */${f.bytes.length}`, ETag: etag });
+        if (st.legacyFeatures && rg && st.staleContent && a === 0) {
+          hit('staleContent'); const n = Math.min(st.staleContent.partial, bytes.length);
+          return send(res, 206, bytes.subarray(0, n), { 'Content-Range': `bytes 0-${n - 1}/${n}`, ...headers });
         }
-        // Simulated truncated stream: advertise the TRUE total but send fewer bytes (stream cut short).
-        if (st.contentTruncate && st.contentTruncate.times > 0) {
-          st.contentTruncate.times--;
-          const end = Math.min(a + st.contentTruncate.at - 1, b);
-          return send(res, 206, f.bytes.subarray(a, end + 1), { 'Content-Range': `bytes ${a}-${b}/${f.bytes.length}`, ETag: etag });
-        }
-        // Simulated stale object header: the first read claims a SMALLER total with a short body (the
-        // "941/5348" failure). Later ranges are served correctly, so a resilient client can fetch the tail.
-        if (st.staleContent && st.staleContent.partial != null && a === 0) {
-          const p = Math.min(st.staleContent.partial, f.bytes.length);
-          return send(res, 206, f.bytes.subarray(0, p), { 'Content-Range': `bytes 0-${p - 1}/${p}`, ETag: etag });
-        }
-        // Simulated corruption: correct length, wrong bytes (integrity check must catch it).
-        if (st.corruptContent) {
-          const body = Buffer.from(f.bytes.subarray(a, b + 1));
-          if (body.length) body[0] ^= 0xff;
-          return send(res, 206, body, { 'Content-Range': `bytes ${a}-${b}/${f.bytes.length}`, ETag: etag });
-        }
-        return send(res, 206, f.bytes.subarray(a, b + 1), { 'Content-Range': `bytes ${a}-${b}/${f.bytes.length}`, ETag: etag });
+        const content = Buffer.from(bytes.subarray(a, b + 1));
+        if (st.legacyFeatures && st.corruptContent) { if (content.length) content[0] ^= 0xff; hit('corruptContent'); }
+        return send(res, rg ? 206 : 200, content, { ...(rg ? { 'Content-Range': `bytes ${a}-${b}/${bytes.length}` } : {}), ...headers });
       }
       if ((mm = /^\/files\/([^/]+)$/.exec(route))) {
         const f = st.files.get(mm[1]); if (!f) return fail(res, 404, 'not_found', 'nope');
         if (m === 'GET') return ok(res, fileJson(f));
         if (m === 'DELETE') { if (u.searchParams.get('permanent') === '1') return fail(res, 400, 'refused', 'test'); f.trashed = true; note('trash', f.id); return ok(res, { id: f.id }); }
         if (m === 'PATCH') {
-          const j = JSON.parse(body.toString());
-          if (j.path) f.path = normFolder(j.path);
-          if (j.name) f.name = j.name;
-          if (j.content && j.content.inline != null) {
-            // Inline content replacement (≤ one chunk): atomic, keeps the id, archives the previous content.
-            const bytes = Buffer.from(String(j.content.inline), 'base64');
-            if (bytes.length > st.oneShotMax) return fail(res, 413, 'too_large', 'inline content must fit one chunk');
-            f.versions = f.versions || []; f.versions.push({ version: (f.version || 1) + 1, bytes: f.bytes });
-            f.bytes = bytes; f.version = (f.version || 1) + 1; f.chunks = null; f.lastModified = tick();
-            storeChunks(bytes); note('revision', f.id);
-            return ok(res, { file: fileJson(f), content: { replaced: bytes.length } });
-          }
-          note('rename', f.id);
-          return ok(res, fileJson(f));
+          const j = JSON.parse(body.toString()); if (j.name) f.name = j.name; if (j.path) f.path = normFolder(j.path);
+          if (j.content && typeof j.content.inline === 'string') {
+            const bytes = Buffer.from(j.content.inline, 'base64');
+            if (st.legacyFeatures && bytes.length > st.oneShotMax) return fail(res, 413, 'too_large', 'inline content exceeds limit');
+            replaceFile(f, bytes, st.legacyFeatures ? [{ idx: 0, offset: 0, size: bytes.length, checksum: sha(bytes) }] : null);
+          } else note('rename', f.id);
+          return ok(res, { file: fileJson(f) });
         }
       }
-      if ((mm = /^\/trash\/([^/]+)\/restore$/.exec(route)) && m === 'POST') { const f = st.files.get(mm[1]); if (f) f.trashed = false; note('restore', mm[1]); return ok(res, { id: mm[1] }); }
+      if ((mm = /^\/trash\/([^/]+)\/restore$/.exec(route)) && m === 'POST') { const f = st.files.get(mm[1]); if (f) f.trashed = false; return ok(res, { id: mm[1] }); }
       if (m === 'DELETE' && (route === '/folders' || /^\/folders\/[^/]+$/.test(route))) {
         if (st.folderDelete === 'none') return fail(res, 405, 'method_not_allowed', 'no');
         let p;
-        if (route === '/folders') p = u.searchParams.get('path');
+        if (route === '/folders') {
+          if (!u.searchParams.get('name')) return fail(res, 400, 'invalid_request', 'Folder name is required');
+          p = normFolder(u.searchParams.get('path')) + u.searchParams.get('name') + '/';
+        }
         else { if (st.folderDelete === 'byPath') return fail(res, 404, 'not_found', 'unknown route'); p = decodeURIComponent(route.slice('/folders/'.length)).replace(/^d/, ''); }
         p = normFolder(p);
         if (!st.folders.has(p) || p === '/') return fail(res, 404, 'not_found', 'no such folder');
         if (u.searchParams.get('permanent') === '1') return fail(res, 400, 'refused', 'test');
         for (const f of [...st.folders]) if (f.startsWith(p)) st.folders.delete(f);       // sub-folders go too
         for (const f of st.files.values()) if (f.path.startsWith(p)) f.trashed = true;    // soft delete of contents
-        note('move', p);
-        return send(res, 204, Buffer.alloc(0));      // empty body on purpose: real servers often do this
+        return ok(res, {});
       }
       if (route === '/folders' && m === 'POST') {
         const j = JSON.parse(body.toString()); const p = normFolder(normFolder(j.path) + j.name);
@@ -279,67 +223,54 @@ function createMockServer(opts = {}) {
       if (route === '/uploads' && m === 'POST') {
         const j = JSON.parse(body.toString());
         if (!/^[0-9a-f-]{36}$/.test(j.clientKey)) return fail(res, 400, 'bad_key', 'clientKey must be uuid');
+        if (st.legacyFeatures && j.baseId && st.noRevisions) return fail(res, 400, 'invalid_request', 'revisions not supported');
         let s = [...st.uploads.values()].find((x) => x.clientKey === j.clientKey);
-        if (!s) {
-          s = { id: 'u' + st.nextId++, ...j, parts: new Map(), done: null, reuse: new Set() };
-          if (j.chunker && j.chunker.algo !== 'buzhash') return fail(res, 400, 'INVALID_CHUNKER', 'bad chunker');
-          // A revision session targets an existing file and exposes its stored parts (by checksum) for reuse.
-          if (j.baseId) {
-            const base = st.files.get(j.baseId);
-            if (!base || base.trashed) return fail(res, 404, 'not_found', 'no base file');
-            if (st.noRevisions) return fail(res, 400, 'invalid_request', 'revisions not supported');
-            s.base = { id: j.baseId, parts: planOf(base) };
-          }
-          st.uploads.set(s.id, s);
-        }
-        const out = { id: s.id, chunkSize: effChunk(), totalChunks: s.totalChunks || Math.max(1, Math.ceil(s.size / effChunk())), received: [...s.parts.keys()], uncertain: [], inProgress: [] };
-        if (s.chunker) out.chunker = s.chunker;
-        if (s.base) { out.revision = true; out.base = s.base; }
-        return ok(res, out, 201);
+        if (!s) { s = { id: 'u' + st.nextId++, ...j, parts: new Map(), offsets: new Map(), done: null }; st.uploads.set(s.id, s); }
+        const base = j.baseId && st.files.get(j.baseId);
+        if (j.baseId && !base) return fail(res, 404, 'NOT_FOUND', 'Base not found');
+        return ok(res, { id: s.id, status: s.done ? (base ? 'committed' : 'ready') : s.parts.size ? 'uploading' : 'pending', fileId: s.done || undefined, clientKey: s.clientKey,
+          chunkSize: st.chunk, totalChunks: s.chunker ? s.totalChunks : Math.max(1, Math.ceil(s.size / st.chunk)), received: [...s.parts.keys()], revision: !!base, ...(base ? { base: { parts: st.legacyFeatures ? planOf(base) : [] } } : {}), ...(s.chunker ? { chunker: s.chunker } : {}) }, 201);
       }
       if ((mm = /^\/uploads\/([^/]+)\/parts\/(\d+)$/.exec(route)) && m === 'PUT') {
         const s = st.uploads.get(mm[1]); if (!s) return fail(res, 404, 'not_found', 'no session');
-        const idx = Number(mm[2]);
-        if (req.headers['x-chunk-reuse'] === '1') {
-          // Claim an already-stored chunk with no body. Reuse is scoped to the account (its own chunks),
-          // so it works both for revisions and for brand-new files (dedup).
-          const want = req.headers['x-content-sha256'];
-          if (!st.chunkStore.has(want)) return fail(res, 409, 'ChunkNotAvailable', 'not stored server-side');
-          s.reuse.add(idx); s.parts.set(idx, st.chunkStore.get(want));
-          return ok(res, { idx, reused: true });
+        let bytes = body;
+        if (st.legacyFeatures && req.headers['x-chunk-reuse'] === '1') {
+          if (body.length) return fail(res, 400, 'INVALID_PART', 'reuse must have no body');
+          bytes = st.chunkStore.get(req.headers['x-content-sha256']);
+          if (!bytes) return fail(res, 409, 'ChunkNotAvailable', 'chunk unavailable');
         }
-        if (body.length && sha(body) !== req.headers['x-content-sha256']) return fail(res, 400, 'checksum', 'bad checksum');
-        s.parts.set(idx, body); st.chunkStore.set(sha(body), body);
-        return ok(res, { idx });
+        if (sha(bytes) !== req.headers['x-content-sha256']) return fail(res, 400, 'checksum', 'bad checksum');
+        const idx = Number(mm[2]);
+        const n = s.chunker ? s.totalChunks : Math.max(1, Math.ceil(s.size / st.chunk));
+        if (idx >= n || bytes.length > st.chunk) return fail(res, 400, 'INVALID_PART', 'Part exceeds plan');
+        if (!s.chunker && bytes.length !== Math.min(st.chunk, s.size - idx * st.chunk)) return fail(res, 400, 'INVALID_PART', 'Incorrect fixed part length');
+        if (st.legacyFeatures && Number(req.headers['x-chunk-size']) !== bytes.length) return fail(res, 400, 'INVALID_PART', 'Incorrect declared part size');
+        s.offsets.set(idx, Number(req.headers['x-chunk-offset'] || idx * st.chunk));
+        s.parts.set(idx, Buffer.from(bytes)); if (st.legacyFeatures) st.chunkStore.set(sha(bytes), Buffer.from(bytes));
+        return ok(res, { idx, ...(bytes !== body ? { reused: true } : {}) });
       }
       if ((mm = /^\/uploads\/([^/]+)\/complete$/.exec(route)) && m === 'POST') {
         const s = st.uploads.get(mm[1]); if (!s) return fail(res, 404, 'not_found', 'no session');
         if (s.done) return ok(res, fileJson(st.files.get(s.done)));
-        const n = s.totalChunks || (st.maxBody ? Math.max(...s.parts.keys()) + 1 : Math.ceil(s.size / effChunk()));
+        const n = s.chunker ? s.totalChunks : Math.max(1, Math.ceil(s.size / st.chunk));
         for (let i = 0; i < n; i++) if (!s.parts.has(i)) return fail(res, 409, 'incomplete', 'missing part ' + i);
         const all = Buffer.concat([...Array(n).keys()].map((i) => s.parts.get(i)));
-        // The stored chunk plan mirrors what the client sent (offsets/sizes), so a manifest/delta matches it.
-        const plan = []; { let off = 0; for (let i = 0; i < n; i++) { const b = s.parts.get(i); plan.push({ idx: i, offset: off, size: b.length, checksum: sha(b) }); off += b.length; } }
-        if (s.base) {
-          // Atomic replace: the file keeps its id (and name/path); the previous bytes are archived as a version.
-          const base = st.files.get(s.base.id);
-          if (base) {
-            base.versions = base.versions || [];
-            base.versions.push({ version: base.versions.length + 1, bytes: base.bytes });
-            base.bytes = all; base.lastModified = tick();
-            base.chunks = plan; base.chunker = s.chunker || null; base.version = (base.version || 1) + 1;
-            s.done = base.id; note('revision', base.id);
-            return ok(res, { id: base.id, revision: true, committed: true, version: base.versions.length + 1, ...fileJson(base) });
-          }
-        }
+        if (all.length !== s.size) return fail(res, 409, 'UploadIncomplete', 'Wrong file size');
+        let offset = 0;
+        for (let i = 0; i < n; i++) { if (s.offsets.get(i) !== offset) return fail(res, 400, 'INVALID_PART', 'Non-contiguous chunks'); offset += s.parts.get(i).length; }
+        const fingerprint = sha(Buffer.from([...Array(n).keys()].map((i) => sha(s.parts.get(i))).join('\n')));
+        if (fingerprint !== s.fingerprint) return fail(res, 409, 'UploadChecksumMismatch', 'Wrong fingerprint');
+        const plan = [...Array(n).keys()].map((idx) => ({ idx, offset: s.offsets.get(idx), size: s.parts.get(idx).length, checksum: sha(s.parts.get(idx)) }));
+        if (s.baseId) { const f = st.files.get(s.baseId); replaceFile(f, all, st.legacyFeatures ? plan : null, s.chunker); s.done = f.id; return ok(res, { id: f.id, revision: true, committed: true, file: fileJson(f), checksum: fingerprint }); }
         const r = createFile(s.name, s.path, all, s.lastModified);
         if (r.err) return fail(res, ...r.err);
-        r.f.chunks = plan; r.f.chunker = s.chunker || null;
-        s.done = r.f.id; note('upload', r.f.id); return ok(res, fileJson(r.f));
+        if (st.legacyFeatures) { r.f.chunks = plan; r.f.chunker = s.chunker || null; storePlan(r.f); }
+        s.done = r.f.id; return ok(res, { file: fileJson(r.f), checksum: fingerprint });
       }
       if ((mm = /^\/uploads\/([^/]+)$/.exec(route)) && m === 'GET') {
         const s = st.uploads.get(mm[1]); if (!s) return fail(res, 404, 'not_found', 'no session');
-        return ok(res, { received: [...s.parts.keys()], uncertain: [], inProgress: [] });
+        return ok(res, { id: s.id, status: s.done ? (s.baseId ? 'committed' : 'ready') : s.parts.size ? 'uploading' : 'pending', fileId: s.done || undefined, clientKey: s.clientKey,
+          chunkSize: st.chunk, totalChunks: s.chunker ? s.totalChunks : Math.max(1, Math.ceil(s.size / st.chunk)), received: [...s.parts.keys()], uncertain: [], inProgress: [] });
       }
       return fail(res, 404, 'not_found', 'unknown route ' + route);
     } catch (e) { return fail(res, 500, 'server_error', String(e)); }

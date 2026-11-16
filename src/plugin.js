@@ -8,6 +8,7 @@ const { CryptoManager } = require('./CryptoManager');
 const { Compressor } = require('./Compressor');
 const { makeT, resolveLang } = require('./i18n');
 const NOTIFY = require('./notify');
+const { randomUuid, folderPathFor, sha256Hex } = require('./util');
 
 const VIEW_TYPE = 'tdrive-sync-status';
 
@@ -71,6 +72,7 @@ function networkLooksCellular() {
 /** requestUrl bypasses CORS and works on Android + Windows. Body/response are ArrayBuffers. */
 async function obsidianTransport({ url, method, headers, body }) {
   const h = { ...headers };
+  if (ArrayBuffer.isView(body)) body = new Uint8Array(body.buffer, body.byteOffset, body.byteLength).slice().buffer;
   let contentType;
   for (const k of Object.keys(h)) if (k.toLowerCase() === 'content-type') { contentType = h[k]; delete h[k]; }
   const r = await requestUrl({ url, method, headers: h, body, contentType, throw: false });
@@ -107,7 +109,7 @@ function makeThrottledTransport(getLimits) {
 }
 
 class ObsidianLocalFS {
-  constructor(app, t) { this.app = app; this.t = t || ((s) => s); }
+  constructor(app, t) { this.app = app; this.t = t || ((s) => s); this._ownChanges = new Map(); this._writes = new Map(); }
   get ad() { return this.app.vault.adapter; }
   async list() { return this.app.vault.getFiles().map((f) => ({ path: f.path, size: f.stat.size, mtime: f.stat.mtime })); }
   readBinary(p) { return this.ad.readBinary(p); }
@@ -115,70 +117,169 @@ class ObsidianLocalFS {
   exists(p) { return this.ad.exists(p); }
   async _isFile(p) { try { const s = await this.ad.stat(p); return !!s && s.type === 'file'; } catch (e) { return false; } }
   async _isDir(p) { try { const s = await this.ad.stat(p); return !!s && s.type === 'folder'; } catch (e) { return false; } }
-  /** Creates every missing parent folder. vault.createFolder is tried first because it also registers the folder in
-   *  Obsidian's own index (on mobile, a folder made only through the raw adapter may be unknown to vault.create*).
-   *  An "already exists" error is never fatal: we re-check and carry on. A real failure names the folder. */
+  /** Only the supported vault API registers folders; disk-only parents cannot safely be used by createBinary. */
   async _mkdirs(p) {
     let cur = '';
     for (const seg of p.split('/').slice(0, -1)) {
       cur = cur ? cur + '/' + seg : seg;
-      if (await this._isDir(cur)) continue;
-      let err = null;
-      try { await this.app.vault.createFolder(cur); }
-      catch (e1) {
-        err = e1;
-        if (!(await this._isDir(cur))) { try { await this.ad.mkdir(cur); err = null; } catch (e2) { err = e2; } }
-      }
-      // "already exists" while stat cannot confirm the folder: trust it unless something known to be a file is there.
-      if (err && /exist/i.test(String(err.message || err)) && (await this.ad.exists(cur)) && !(await this._isFile(cur))) continue;
-      if (err && !(await this._isDir(cur))) {
-        const clash = (await this.ad.exists(cur)) ? this.t('local.nameClash') : '';
-        throw new Error(this.t('local.couldNotCreate', { dir: cur, clash, msg: (err.message || err) }));
+      const indexed = this.app.vault.getAbstractFileByPath(cur);
+      if (indexed && Array.isArray(indexed.children) && await this.ad.exists(cur)) continue;
+      try {
+        if (await this.ad.exists(cur)) throw new Error('Folder exists on disk but is not registered in the vault; wait for Obsidian to index it');
+        this._trackOwnChange(cur, 'folder');
+        await this.app.vault.createFolder(cur);
+        const folder = this.app.vault.getAbstractFileByPath(cur);
+        if (!folder || !Array.isArray(folder.children) || !(await this.ad.exists(cur))) throw new Error('Created folder was not registered in the vault');
+      } catch (e) {
+        this._ownChanges.delete(cur);
+        const clash = (await this._isFile(cur)) ? this.t('local.nameClash') : '';
+        throw new Error(this.t('local.couldNotCreate', { dir: cur, clash, msg: e.message || e }));
       }
     }
   }
-  async writeBinary(p, buf, mtime) {
-    await this._mkdirs(p);
-    const opts = mtime ? { mtime } : undefined;
-    const attempt = async () => {
-      const f = this.app.vault.getAbstractFileByPath(p);
-      if (f instanceof TFile) await this.app.vault.modifyBinary(f, buf, opts);
-      else if (await this.ad.exists(p)) await this.ad.writeBinary(p, buf, opts);
-      else await this.app.vault.createBinary(p, buf, opts);
-    };
-    try { await attempt(); }
-    catch (e) {
-      // Folder not yet known to the vault index, or the file already exists on disk but not in the index.
-      await this._mkdirs(p);
-      try { await this.ad.writeBinary(p, buf, opts); }
-      catch (e2) { throw new Error(this.t('local.couldNotWrite', { path: p, msg: (e2.message || e.message) })); }
-    }
-    if (!(await this.ad.exists(p))) throw new Error(this.t('local.notAppeared', { path: p }));
+  async writeBinary(p, buf, mtime, options = {}) {
+    return this._writeBinary(p, buf, mtime, !!options.createOnly, options.expectedHash);
   }
-  /** Atomically replaces a file's content: write a temp sibling, then rename it over the target so a reader
-   *  never sees a half-written file. Falls back to a direct (single-call) write when the adapter cannot rename.
-   *  The bytes are already integrity-verified by the engine before this is called. */
-  async writeBinaryAtomic(p, buf, mtime) {
-    const opts = mtime ? { mtime } : undefined;
-    const tmp = p + '.tdrive-part';
+
+  // Start the byte read at event dispatch, before any hashing or auto-sync settings checks.
+  // Supplementary recovery, not CAS: a queued read can miss a transient external edit.
+  // It must never be used as permission for an unchecked binary replacement.
+  captureChange(p) {
+    const write = this._writes.get(p);
+    if (!write) return;
     try {
-      await this._mkdirs(p);
-      await this.ad.writeBinary(tmp, buf, opts);
-      if (typeof this.ad.rename === 'function') {
-        try { await this.ad.rename(tmp, p); }
-        catch (e) { try { await this.ad.remove(p); } catch (_) { /* may not exist */ } await this.ad.rename(tmp, p); }
-        if (await this.ad.exists(tmp)) { try { await this.ad.remove(tmp); } catch (_) { /* leftover cleanup */ } }
-        if (await this.ad.exists(p)) {
-          // Make sure Obsidian's index knows the final content (adapter writes bypass the index).
-          const f = this.app.vault.getAbstractFileByPath(p);
-          if (f instanceof TFile && this.app.vault.modifyBinary) { try { await this.app.vault.modifyBinary(f, buf, opts); } catch (_) { /* index-only refresh */ } }
-          return;
-        }
-      } else {
-        await this.ad.remove(tmp);
+      const capture = this.ad.readBinary(p);
+      write.captures.push(Promise.resolve(capture).then((data) => ({ data }), (error) => ({ error })));
+    } catch (error) { write.captures.push(Promise.resolve({ error })); }
+  }
+
+  _trackOwnChange(p, hash) {
+    for (const [path, change] of this._ownChanges) if (change.until < Date.now()) this._ownChanges.delete(path);
+    this._ownChanges.set(p, { hash, until: Date.now() + 3000 });
+  }
+
+  async isOwnChange(p) {
+    const change = this._ownChanges.get(p);
+    if (!change || change.until < Date.now()) { this._ownChanges.delete(p); return false; }
+    try {
+      if (change.hash === null) return !(await this.ad.exists(p));
+      if (change.hash === 'folder') return await this._isDir(p);
+      return await sha256Hex(await this.ad.readBinary(p)) === change.hash;
+    } catch (_) { return false; }
+  }
+
+  /** Recovery-backed, not an atomic replacement: retain old bytes until the supported vault commit is verified. */
+  async _writeBinary(p, buf, mtime, createOnly, expectedHash) {
+    if (expectedHash != null && !(await this.ad.exists(p))) throw Object.assign(new Error('Local file disappeared since it was reviewed; original was not replaced'), { code: 'LOCAL_CHANGED' });
+    await this._mkdirs(p);
+    const opts = Number.isFinite(mtime) ? { mtime } : undefined;
+    const f = this.app.vault.getAbstractFileByPath(p);
+    const exists = await this.ad.exists(p);
+    if (createOnly && (f || exists)) {
+      const error = new Error('Local file appeared during download: ' + p);
+      error.code = 'LOCAL_FILE_EXISTS';
+      throw error;
+    }
+    if (exists && !(f instanceof TFile)) throw new Error('Local file exists on disk but is not registered as a vault file: ' + p + '; wait for Obsidian to index it');
+    if (f && !(f instanceof TFile)) throw new Error('Not a file: ' + p);
+    const hash = await sha256Hex(buf);
+    let backup = null;
+    let backupVerified = false;
+    let write = null;
+    const recoveryPaths = [];
+    const preserveChanges = async () => {
+      if (!write) return false;
+      // Events may arrive while recovery I/O is pending; drain every observed snapshot.
+      while (write.processed < write.captures.length) {
+        const snapshot = await write.captures[write.processed++];
+        if (snapshot.error) throw new Error('Could not capture an interleaving local edit: ' + (snapshot.error.message || snapshot.error));
+        const capturedHash = await sha256Hex(snapshot.data);
+        if (capturedHash === hash || write.hashes.has(capturedHash)) continue;
+        write.changed = true;
+        const recovery = await this._tempPath(p, 'edit');
+        recoveryPaths.push(recovery);
+        await this.ad.writeBinary(recovery, snapshot.data);
+        if (await sha256Hex(await this.ad.readBinary(recovery)) !== capturedHash) throw new Error('Interleaving edit recovery verification failed');
+        write.hashes.add(capturedHash);
       }
-    } catch (e) { /* fall through to the plain write */ }
-    await this.writeBinary(p, buf, mtime);
+      return write.changed;
+    };
+    try {
+      if (f) {
+        const old = await this.ad.readBinary(p);
+        const oldHash = await sha256Hex(old);
+        if (expectedHash != null && oldHash !== expectedHash) throw Object.assign(new Error('Local file changed since it was reviewed; original was not replaced'), { code: 'LOCAL_CHANGED' });
+        backup = await this._tempPath(p, 'backup');
+        await this.ad.writeBinary(backup, old);
+        if (await sha256Hex(await this.ad.readBinary(backup)) !== oldHash) throw new Error('Recovery backup verification failed');
+        backupVerified = true;
+        if (this.app.vault.getAbstractFileByPath(p) !== f || await sha256Hex(await this.ad.readBinary(p)) !== oldHash) throw new Error('Local file changed while preparing its recovery backup');
+        write = { captures: [], processed: 0, hashes: new Set([oldHash]), changed: false };
+        if (this._writes.has(p)) throw new Error('Another local write is already in progress');
+        this._writes.set(p, write);
+        this._trackOwnChange(p, hash);
+        // Installed desktop/mobile adapters queue process's read + synchronous transform + write.
+        // It is text-only, not OS CAS. Event snapshots cannot protect arbitrary binary writes.
+        let oldText, newText;
+        try {
+          const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
+          oldText = decoder.decode(old); newText = decoder.decode(buf);
+          if (await sha256Hex(new TextEncoder().encode(oldText)) !== oldHash || await sha256Hex(new TextEncoder().encode(newText)) !== hash) oldText = undefined;
+        } catch (_) { oldText = undefined; }
+        if (oldText === undefined || typeof this.app.vault.process !== 'function') {
+          const reason = oldText === undefined
+            ? 'Obsidian cannot safely compare and replace arbitrary binary content in its write queue'
+            : 'Safe existing-file replacement requires Obsidian\'s queued text process API';
+          const error = new Error(reason + '; original retained. Incoming replacement was not written; keep the local file or download the incoming version as a new file.');
+          error.code = 'LOCAL_UNSAFE_REPLACEMENT';
+          throw error;
+        }
+        await this.app.vault.process(f, (current) => {
+          if (this.app.vault.getAbstractFileByPath(p) !== f || current !== oldText) throw Object.assign(new Error('Local file changed before the queued text commit'), { code: 'LOCAL_CHANGED' });
+          return newText;
+        }, opts);
+      } else {
+        if (await this.ad.exists(p) || this.app.vault.getAbstractFileByPath(p)) {
+          const error = new Error('Local file appeared before creation: ' + p);
+          error.code = 'LOCAL_FILE_EXISTS';
+          throw error;
+        }
+        this._trackOwnChange(p, hash);
+        try { await this.app.vault.createBinary(p, buf, opts); }
+        catch (e) {
+          if (e.code === 'EEXIST' || /^(EEXIST\b|File already exists\.?$)/.test(e.message || '')) e.code = 'LOCAL_FILE_EXISTS';
+          throw e;
+        }
+      }
+      const committed = this.app.vault.getAbstractFileByPath(p);
+      const disk = await this.ad.stat(p);
+      if (!(committed instanceof TFile) || !disk || committed.stat.size !== disk.size || committed.stat.mtime !== disk.mtime || disk.size !== buf.byteLength || await sha256Hex(await this.ad.readBinary(p)) !== hash) throw new Error('Write did not produce matching vault index, disk stats, and content');
+      if (await preserveChanges()) throw new Error('Local file changed during replacement; interleaving bytes retained in recovery (no baseline committed)');
+      this._trackOwnChange(p, hash);
+      if (backup) { try { await this.ad.remove(backup); } catch (_) { /* a redundant recovery copy is safe */ } }
+      return { size: committed.stat.size, mtime: committed.stat.mtime };
+    } catch (e) {
+      this._ownChanges.delete(p);
+      try { await preserveChanges(); } catch (captureError) { e = new Error((e.message || e) + '; ' + (captureError.message || captureError)); }
+      const recovery = backup ? (backupVerified ? '; previous bytes retained in recovery backup ' : '; original was not replaced; incomplete recovery backup at ') + backup : '';
+      const error = new Error('Could not write local file ' + p + ': ' + (e.message || e) + recovery + (recoveryPaths.length ? '; interleaving edit recovery at ' + recoveryPaths.join(', ') : ''));
+      if (e.code) error.code = e.code;
+      if (backup) error.backupPath = backup;
+      if (recoveryPaths.length) error.recoveryPaths = recoveryPaths;
+      throw error;
+    } finally { if (write && this._writes.get(p) === write) this._writes.delete(p); }
+  }
+  async _tempPath(p, kind = 'part') {
+    const i = p.lastIndexOf('/');
+    let tmp;
+    do { tmp = p.slice(0, i + 1) + '.' + p.slice(i + 1) + '.tdrive-' + kind + '-' + randomUuid(); }
+    while (await this.ad.exists(tmp));
+    return tmp;
+  }
+
+  /** Engine compatibility name; this is a recovery-backed vault write, not a proven atomic replacement. */
+  async writeBinaryAtomic(p, buf, mtime, options = {}) {
+    return this.writeBinary(p, buf, mtime, options);
   }
 
   /** Folder paths known to the vault (null when the API is unavailable, so the engine skips folder deletion). */
@@ -191,31 +292,55 @@ class ObsidianLocalFS {
   /** Returns false (and trashes nothing) if the folder still holds anything on disk, e.g. hidden files the vault index never lists. */
   async trashFolder(p) {
     const f = this.app.vault.getAbstractFileByPath(p);
-    if (!f) return true;                              // already gone
-    try { const l = await this.ad.list(p); if ((l.files && l.files.length) || (l.folders && l.folders.length)) return false; } catch (e) { /* cannot list: fall through to the engine's own emptiness check */ }
-    if (this.app.fileManager.trashFile) await this.app.fileManager.trashFile(f);
-    else await this.app.vault.trash(f, true);
+    if (!f) return !(await this.ad.exists(p));         // an unindexed disk folder must be kept
+    if (!Array.isArray(f.children)) return false;      // a file replaced the planned folder
+    try { const l = await this.ad.list(p); if (!l || !Array.isArray(l.files) || !Array.isArray(l.folders) || l.files.length || l.folders.length) return false; } catch (e) { return false; }
+    this._trackOwnChange(p, null);
+    try {
+      if (this.app.fileManager.trashFile) await this.app.fileManager.trashFile(f);
+      else await this.app.vault.trash(f, true);
+    } catch (e) { this._ownChanges.delete(p); throw e; }
     return true;
   }
   async trash(p) {
     const f = this.app.vault.getAbstractFileByPath(p);
     if (!f) throw new Error('File not found: ' + p);
-    if (this.app.fileManager.trashFile) await this.app.fileManager.trashFile(f);
-    else await this.app.vault.trash(f, true);
+    if (!(f instanceof TFile)) throw new Error('Not a file: ' + p);
+    this._trackOwnChange(p, null);
+    try {
+      if (this.app.fileManager.trashFile) await this.app.fileManager.trashFile(f);
+      else await this.app.vault.trash(f, true);
+    } catch (e) { this._ownChanges.delete(p); throw e; }
   }
-  /** True when the adapter can append bytes (enables streaming large downloads to disk). */
-  get canStream() { return typeof this.ad.appendBinary === 'function'; }
-  /** Opens a streaming sink at `p`: the first chunk overwrites, later chunks append. */
+  /** Staging is streamed, but the supported indexed create API requires a buffered final commit. */
+  get canStream() { return typeof this.ad.appendBinary === 'function' && typeof this.ad.readBinary === 'function' && typeof this.app.vault.createBinary === 'function'; }
+  /** Streams to a private staging file. close commits a new file; abort removes only that staging file. */
   async beginStreamWrite(p) {
+    if (!this.canStream) throw new Error('Streaming requires appendBinary, readBinary, and vault.createBinary support');
+    if (await this.ad.exists(p)) throw new Error('Local file already exists: ' + p);
     await this._mkdirs(p);
-    const self = this; let n = 0;
+    const tmp = await this._tempPath(p);
+    const self = this; let closed = false;
+    const abort = async () => { closed = true; if (await self.ad.exists(tmp)) await self.ad.remove(tmp); };
+    try { await this.ad.writeBinary(tmp, new ArrayBuffer(0)); }
+    catch (e) { try { await abort(); } catch (_) { /* staging cleanup */ } throw e; }
     return {
       async write(chunk) {
+        if (closed) throw new Error('Stream is closed');
         const buf = chunk instanceof ArrayBuffer ? chunk : (chunk.buffer ? chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength) : chunk);
-        if (n++ === 0) await self.ad.writeBinary(p, buf);
-        else await self.ad.appendBinary(p, buf);
+        await self.ad.appendBinary(tmp, buf);
       },
-      async close() { return p; },
+      async close() {
+        if (closed) throw new Error('Stream is closed');
+        closed = true;
+        try {
+          if (await self.ad.exists(p)) throw new Error('Local file appeared during download: ' + p);
+          await self._writeBinary(p, await self.ad.readBinary(tmp), undefined, true);
+          try { await abort(); } catch (_) { /* verified commit succeeded; redundant staging is safe */ }
+          return p;
+        } catch (e) { try { await abort(); } catch (_) { /* staging cleanup */ } throw e; }
+      },
+      abort,
     };
   }
 }
@@ -252,9 +377,31 @@ class ConflictModal extends Modal {
   constructor(app, plugin, path) { super(app); this.plugin = plugin; this.path = path; }
   onOpen() {
     const { contentEl } = this; const t = this.plugin.t;
+    contentEl.empty(); contentEl.addClass('tdrive-sync-view');
+    this._closed = false; const previewToken = this._previewToken = {};
     contentEl.createEl('h3', { text: t('conflict.title', { path: this.path }) });
     const c = this.plugin.ledger.getConflict(this.path);
+    if (!c) {
+      contentEl.createEl('p', { text: t('conflict.none') });
+      contentEl.createEl('button', { text: t('common.close') }).onclick = () => this.close();
+      return;
+    }
+    const reviewed = JSON.parse(JSON.stringify(c));
+    const reviewedScope = this.plugin.ledger.data.meta.syncScope;
     contentEl.createEl('p', { text: t('conflict.body', { copy: c ? c.copyPath : '?' }) });
+    const openFile = async (path) => {
+      try {
+        const file = this.plugin.app.vault.getAbstractFileByPath(path);
+        if (!file || Array.isArray(file.children)) throw new Error(t('conflict.fileUnavailable'));
+        this.close();
+        await this.plugin.app.workspace.getLeaf(false).openFile(file);
+      } catch (e) { new Notice(t('conflict.resolveFailed', { msg: this.plugin.redact(e.message) }), 8000); }
+    };
+    const tools = contentEl.createDiv({ cls: 'tdrive-sync-row' });
+    const openLocal = tools.createEl('button', { text: t('conflict.openLocal') }); openLocal.onclick = () => openFile(this.path);
+    const openRemote = tools.createEl('button', { text: t('conflict.openRemote') }); openRemote.onclick = () => openFile(c.copyPath);
+    const reload = tools.createEl('button', { text: t('conflict.refresh') });
+    reload.onclick = () => { if (!this._resolving) this.onOpen(); };
     // Simple, read-only side-by-side preview (no line-by-line merge editor): the local file next to the
     // conflict copy of the remote version, so the user can decide. Text files only, first 40 lines each.
     try {
@@ -264,7 +411,7 @@ class ConflictModal extends Modal {
       if (local && copyFile && isText(local) && isText(copyFile)) {
         const read = async (f) => { try { return await this.plugin.app.vault.read(f); } catch (e) { return null; } };
         Promise.all([read(local), read(copyFile)]).then(([a, b]) => {
-          if (a == null || b == null) return;
+          if (this._closed || this._previewToken !== previewToken || a == null || b == null) return;
           const preview = contentEl.createDiv({ cls: 'tdrive-conflict-preview' });
           const left = preview.createDiv({ cls: 'tdrive-conflict-col' });
           left.createEl('h5', { text: t('conflict.localCol') });
@@ -275,23 +422,58 @@ class ConflictModal extends Modal {
         }).catch(() => { /* preview is optional */ });
       }
     } catch (e) { /* preview is best effort */ }
+    const status = contentEl.createEl('p', { cls: 'tdrive-conflict-result' });
+    if (typeof status.setAttribute === 'function') { status.setAttribute('role', 'status'); status.setAttribute('aria-live', 'polite'); }
+    const resultActions = contentEl.createDiv({ cls: 'tdrive-sync-row' });
+    if (this.plugin.settings.paused) status.setText(t('notice.pausedDone'));
+    else if (this.plugin._busy()) status.setText(t('notice.busy'));
+    const buttons = [];
+    const base = this.plugin.ledger.getFile(this.path);
+    const mergeAvailable = !!(base && typeof base.baseText === 'string');
+    const disable = (busy) => {
+      reload.disabled = openLocal.disabled = openRemote.disabled = busy;
+      for (const [button, key] of buttons) {
+        const disabled = busy || key !== 'cancel' && (this.plugin._busy() || this.plugin.settings.paused || key === 'merge' && !mergeAvailable);
+        if (typeof button.setDisabled === 'function') button.setDisabled(disabled);
+        else if (button.buttonEl) button.buttonEl.disabled = disabled;
+      }
+    };
     const opts = [
-      ['merge', 'conflict.merge', 'conflict.mergeDesc'],
+      ['merge', 'conflict.merge', mergeAvailable ? 'conflict.mergeDesc' : 'conflict.mergeUnavailable'],
       ['local', 'conflict.local', 'conflict.localDesc'],
       ['remote', 'conflict.remote', 'conflict.remoteDesc'],
       ['both', 'conflict.both', 'conflict.bothDesc'],
       ['cancel', 'conflict.cancel', 'conflict.cancelDesc'],
     ];
     for (const [key, labelKey, descKey] of opts) {
-      new Setting(contentEl).setName(t(labelKey)).setDesc(t(descKey)).addButton((b) => b.setButtonText(t(labelKey)).onClick(async () => {
-        this.close();
-        if (key === 'cancel') return;
-        try { await this.plugin.resolveConflict(this.path, key); new Notice(t('conflict.resolved')); }
-        catch (e) { new Notice(t('conflict.resolveFailed', { msg: this.plugin.redact(e.message) }), 8000); }
-      }));
+      new Setting(contentEl).setName(t(labelKey)).setDesc(t(descKey)).addButton((b) => {
+        buttons.push([b, key]);
+        b.setButtonText(t(labelKey)).onClick(async () => {
+          if (this._resolving || this._closed) return;
+          if (key === 'cancel') { this.close(); return; }
+          if (this.plugin._busy() || this.plugin.settings.paused) {
+            status.setText(t(this.plugin.settings.paused ? 'notice.pausedDone' : 'notice.busy')); disable(false); return;
+          }
+          if (key === 'merge' && !mergeAvailable) { status.setText(t('conflict.mergeUnavailable')); return; }
+          this._resolving = true; disable(true); resultActions.empty(); status.setText(t('conflict.resolving'));
+          try {
+            const result = await this.plugin.resolveConflict(this.path, key, { conflict: reviewed, scope: reviewedScope });
+            if (result && result.resolved) { new Notice(t('conflict.resolved')); if (!this._closed) this.close(); }
+            else if (!this._closed) {
+              status.setText(t(result && result.draft ? 'conflict.mergeNeedsReview' : 'conflict.reviewAgain', { draft: result && result.draft || '' }));
+              if (result && result.draft) resultActions.createEl('button', { text: t('conflict.openDraft') }).onclick = () => openFile(result.draft);
+            }
+          } catch (e) {
+            const message = t('conflict.resolveFailed', { msg: this.plugin.redact(e.message) });
+            if (!this._closed) status.setText(message);
+            new Notice(message, 8000);
+          } finally { this._resolving = false; if (!this._closed) disable(false); }
+        });
+      });
     }
+    disable(false);
   }
-  onClose() { this.contentEl.empty(); }
+  onClose() { this._closed = true; this._previewToken = null; this.contentEl.empty(); }
 }
 
 class ApproveDeletesModal extends Modal {
@@ -303,7 +485,9 @@ class ApproveDeletesModal extends Modal {
     const pre = contentEl.createEl('pre', { cls: 'tdrive-sync-log' });
     pre.setText(items.slice(0, 60).map((i) => (i.action === 'deleteRemote' ? t('pending.remoteItem') : t('pending.localItem')) + i.path).join('\n') + (items.length > 60 ? t('pending.more', { n: items.length - 60 }) : ''));
     const row = contentEl.createDiv({ cls: 'tdrive-sync-row' });
-    row.createEl('button', { text: t('pending.approve') }).onclick = () => { this.close(); this.plugin.runSync({ approveDeletes: true }); };
+    const approvedDeletes = items.map((item) => ({ ...item }));
+    const approvedScope = this.plugin.ledger.data.meta.syncScope;
+    row.createEl('button', { text: t('pending.approve') }).onclick = () => { this.close(); this.plugin.runSync({ approveDeletes: true, approvedDeletes, approvedScope }); };
     row.createEl('button', { text: t('common.cancel') }).onclick = () => this.close();
   }
   onClose() { this.contentEl.empty(); }
@@ -367,16 +551,14 @@ class NotifyPreviewModal extends Modal {
 }
 
 class VersionsModal extends Modal {
-  constructor(app, plugin, path, remoteId) { super(app); this.plugin = plugin; this.path = path; this.remoteId = remoteId; }
+  constructor(app, plugin, path, remoteId, versions, scope) { super(app); this.plugin = plugin; this.path = path; this.remoteId = remoteId; this.versions = versions; this.scope = scope; }
   async onOpen() {
     const { contentEl } = this; const p = this.plugin; const t = p.t;
     contentEl.empty(); contentEl.addClass('tdrive-sync-view');
     contentEl.createEl('h3', { text: t('versions.title', { path: this.path }) });
     const status = contentEl.createEl('p', { text: t('common.loading') });
     try {
-      const client = p.makeClient();
-      const r = await client.request({ path: `/files/${encodeURIComponent(this.remoteId)}/versions` });
-      const list = (r && (r.versions || r.items)) || (Array.isArray(r) ? r : []);
+      const list = this.versions;
       if (!list.length) { status.setText(t('versions.none')); return; }
       status.setText(t('versions.hint'));
       for (const v of list) {
@@ -384,7 +566,23 @@ class VersionsModal extends Modal {
         const vid = v.id || v.versionId || v.version;
         row.createSpan({ text: `${new Date(v.created_at || v.createdAt || 0).toLocaleString()} · ${v.size != null ? v.size + ' B' : ''}` });
         row.createEl('button', { text: t('versions.restore') }).onclick = async () => {
-          try { await client.request({ method: 'POST', path: `/files/${encodeURIComponent(this.remoteId)}/versions/${encodeURIComponent(String(vid))}/restore` }); new Notice(t('versions.restored')); this.close(); p.runSync({ silent: true }); }
+          try {
+            if (p._unloaded || p.settings.paused) throw new Error(t('notice.pausedDone'));
+            await p._withOperation(async () => {
+              const { engine, id, scope } = await p._remoteFileContext(this.path.normalize('NFC'));
+              if (id !== this.remoteId || scope !== this.scope) throw new Error('Sync destination changed; reopen file versions.');
+              const lock = await engine.acquireOperationLease();
+              if (lock && lock.blocked) throw new Error(t('notice.busy'));
+              p._checkOperation(engine);
+              const current = await engine.client.getFile(id);
+              p._checkOperation(engine);
+              if (engine._capabilities && engine._capabilities.expectedContentVersion && current.contentVersion == null) throw new Error('Current content version missing; restore stopped.');
+              await engine.client.request({ method: 'POST', path: `/files/${encodeURIComponent(id)}/versions/${encodeURIComponent(String(vid))}/restore`, headers: { 'Content-Type': 'application/json' }, body: new TextEncoder().encode(JSON.stringify(current.contentVersion == null ? {} : { expectedVersion: current.contentVersion })).buffer });
+              engine._markRemoteMutated();
+              p._checkOperation(engine);
+            });
+            new Notice(t('versions.restored')); this.close(); p.runSync({ silent: true });
+          }
           catch (e) { new Notice(t('versions.failed', { msg: p.redact(e.message) }), 8000); }
         };
       }
@@ -430,7 +628,13 @@ class SearchModal extends Modal {
       results.empty();
       const q = input.value.trim(); if (!q) return;
       try {
-        const r = await p.makeClient().request({ path: '/search', query: { q, limit: 50 } });
+        const r = await p._withOperation(async () => {
+          const engine = p.makeEngine();
+          p._checkOperation(engine);
+          const result = await engine.client.request({ path: '/search', query: { q, limit: 50 } });
+          p._checkOperation(engine);
+          return result;
+        });
         const files = (r && (r.files || r.results)) || [];
         if (!files.length) { results.createEl('p', { text: t('search.none') }); return; }
         for (const f of files) results.createEl('div').setText(`${f.path || '/'}${f.name} · ${f.size || 0} B`);
@@ -456,7 +660,8 @@ class SyncStatusView extends ItemView {
     const box = el.createDiv({ cls: 'tdrive-sync-box' });
     const line = (k, v) => box.createDiv().setText(`${k}: ${v}`);
     line(t('status.connection'), p.connection);
-    line(t('status.state'), p.settings.paused ? t('status.paused') : (p.engine && p.engine.running ? t('status.running') : t('status.idle')));
+    line(p.lang === 'ar' ? 'نسخة الإضافة المحملة' : 'Loaded Plugin Version', meta.runtimeVersion || (p.manifest && p.manifest.version) || '?');
+    line(t('status.state'), p.settings.paused ? t('status.paused') : (p._busy() ? t('status.running') : t('status.idle')));
     if (p.progress && p.engine && p.engine.running) line(t('status.progress'), `${p.progress.done}/${p.progress.total} ${p.progress.current || ''}`);
     line(t('status.lastSuccess'), fmtTime(meta.lastSuccessAt));
     if (last) {
@@ -468,18 +673,37 @@ class SyncStatusView extends ItemView {
     row.createEl('button', { text: t('status.syncNow') }).onclick = () => p.runSync();
     row.createEl('button', { text: p.settings.paused ? t('status.resume') : t('status.pause') }).onclick = () => (p.settings.paused ? p.resume() : p.pause());
     row.createEl('button', { text: t('status.testConn') }).onclick = () => p.testConnection();
+    const blockedFolders = Object.values(meta.blockedFolders || {}).filter((b) => b && (!b.scope || b.scope === meta.syncScope));
+    if (blockedFolders.length) {
+      el.createEl('h4', { text: p.lang === 'ar' ? `حذف مجلدات مؤجل من الخادم (${blockedFolders.length})` : `Folder Deletions Blocked by Server (${blockedFolders.length})` });
+      if (blockedFolders.some((b) => b.code === 'FOLDER_NOT_EMPTY')) el.createEl('p', { text: p.lang === 'ar' ? 'احتفظ Tdrive بالمجلدات لأن ملفات أو مجلدات جديدة وصلت قبل الحذف الذري. لم تحذف المحتويات الجديدة؛ أعد الفحص لمراجعتها.' : 'Tdrive preserved these folders because new files or folders arrived before the atomic empty-folder deletion. New arrivals were not deleted; recheck to review them.' });
+      if (blockedFolders.some((b) => b.code !== 'FOLDER_NOT_EMPTY')) el.createEl('p', { text: p.lang === 'ar' ? 'يرفض Tdrive حذف هذه المجلدات بسبب جلسة رفع. تستمر مزامنة الملفات الأخرى؛ لن تلغى جلسة مكتملة للتحايل على الخطأ.' : 'Tdrive is refusing these folder deletions because of an upload session. Other files can still sync; committed sessions will not be aborted as a workaround.' });
+      if (blockedFolders.some((b) => b.expiredUploadCount > 0)) el.createEl('p', { cls: 'mod-warning', text: p.lang === 'ar' ? 'الخادم ما زال يعد جلسات منتهية المدة نشطة. الحذف المؤجل يخص المجلد فقط، لا الملفات المتزامنة. لم تُلغَ هذه الجلسات أو تُحذف بياناتها؛ يلزم تنظيفها من خدمة API أو اتخاذ قرار صريح بشأنها.' : 'The server still classifies expired upload sessions as active. Only folder deletion is deferred, not synchronized files. These sessions and their data were not cancelled; API cleanup or an explicit decision is required.' });
+      el.createEl('pre', { cls: 'tdrive-sync-log' }).setText(blockedFolders.map((b) => `${b.path}: ${b.code || 'UPLOAD_IN_PROGRESS'}${b.requestId ? ' [' + b.requestId + ']' : ''}\n${p.lang === 'ar' ? 'المحاولة التالية' : 'Next Retry'}: ${fmtTime(b.nextRetryAt)}`).join('\n'));
+      for (const b of blockedFolders) for (const session of b.blockingUploads || []) el.createEl('div').setText(`${session.id}: ${session.status} · ${p.lang === 'ar' ? 'انتهاء المدة' : 'Expires'}: ${fmtTime(session.expiresAt)}${session.expired ? (p.lang === 'ar' ? ' (منتهية)' : ' (expired)') : ''}`);
+      const recheck = el.createEl('button', { text: p.lang === 'ar' ? 'إعادة فحص API' : 'Recheck API' });
+      recheck.disabled = p._busy();
+      recheck.onclick = async () => {
+        if (p._busy()) return;
+        recheck.disabled = true;
+        try { await p.runSync({ retryBlockedFolders: true }); }
+        finally { recheck.disabled = p._busy(); }
+      };
+    }
     const pend = meta.blockedDeletes;
     if (pend && pend.items && pend.items.length) {
       el.createEl('h4', { text: t('status.blockedDeletes', { n: pend.items.length }) });
       const why = { limit: t('status.reasonLimit'), 'empty-local': t('status.reasonEmptyLocal'), 'empty-remote': t('status.reasonEmptyRemote') }[pend.reason] || pend.reason;
       el.createDiv().setText(t('status.reason', { why, at: fmtTime(pend.at) }));
-      if (pend.reason === 'limit') el.createEl('button', { text: t('common.reviewApprove') }).onclick = () => new ApproveDeletesModal(p.app, p, pend).open();
+      if (pend.reason === 'limit' || pend.reason === 'changed') el.createEl('button', { text: t('common.reviewApprove') }).onclick = () => new ApproveDeletesModal(p.app, p, pend).open();
     }
     const cs = p.ledger.conflictKeys();
     el.createEl('h4', { text: t('status.conflicts', { n: cs.length }) });
+    if (cs.length) el.createEl('p', { text: t('conflict.pendingHint') });
     for (const path of cs) {
       const r = el.createDiv({ cls: 'tdrive-sync-row' }); r.createSpan({ text: path });
-      r.createEl('button', { text: t('status.resolve') }).onclick = () => new ConflictModal(p.app, p, path).open();
+      const resolve = r.createEl('button', { text: t('status.resolve') }); resolve.disabled = p._busy();
+      resolve.onclick = () => { if (!p._busy()) new ConflictModal(p.app, p, path).open(); };
     }
     el.createEl('h4', { text: t('status.log') });
     const pre = el.createEl('pre', { cls: 'tdrive-sync-log' });
@@ -624,7 +848,8 @@ class TdriveSettingTab extends PluginSettingTab {
 class TdriveSyncPlugin extends Plugin {
   async onload() {
     this.listeners = new Set(); this.progress = null; this.engine = null; this.connection = '—';
-    this._timer = null; this._changeTimer = null; this._quietUntil = 0; this._crypto = null; this._cryptoTag = '';
+    this._timer = null; this._changeTimer = null; this._startupTimer = null; this._unloaded = false; this._quietUntil = 0; this._crypto = null; this._cryptoTag = '';
+    this._operation = null; this._pendingChange = false;
     this._retryNotified = false;
     this.settings = Object.assign({}, DEFAULTS, await this.loadData());
     this.applyLanguage();
@@ -635,6 +860,8 @@ class TdriveSyncPlugin extends Plugin {
       write: (s) => ad.write(statePath, s),
     });
     await this.ledger.load();
+    if (this.manifest && typeof this.manifest.version === 'string') this.ledger.data.meta.runtimeVersion = this.manifest.version;
+    await this._bindDeviceIdentity();
     this.local = new ObsidianLocalFS(this.app, this.t);
 
     this.registerView(VIEW_TYPE, (leaf) => new SyncStatusView(leaf, this));
@@ -654,20 +881,59 @@ class TdriveSyncPlugin extends Plugin {
     cmd('share-file', 'cmd.share', () => this.shareCurrent());
     cmd('search-remote', 'cmd.search', () => this.searchRemote());
     cmd('choose-folders', 'cmd.chooseFolders', () => this.chooseSyncFolders());
-    cmd('view-conflicts', 'cmd.viewConflicts', () => this.activateView());
+    cmd('view-conflicts', 'cmd.viewConflicts', () => this.viewConflicts());
     cmd('view-sync-log', 'cmd.viewLog', () => this.activateView());
     cmd('export-log', 'cmd.exportLog', () => this.exportLog());
     cmd('pause-sync', 'cmd.pause', () => this.pause());
     cmd('resume-sync', 'cmd.resume', () => this.resume());
     this.registerChangeSync();
     this.setupAutoSync(); this.refreshStatus();
-    if (this.settings.syncOnStartup) this.app.workspace.onLayoutReady(() => window.setTimeout(() => this.runSync({ silent: true }), 5000));
+    if (this.settings.syncOnStartup) this.app.workspace.onLayoutReady(() => {
+      if (this._unloaded) return;
+      this._startupTimer = window.setTimeout(() => { this._startupTimer = null; if (!this._unloaded && this.settings.syncOnStartup && this.withinSchedule()) this.runSync({ silent: true, reason: 'startup' }); }, 5000);
+    });
+  }
+
+  /** Installation-local ownership must not be inherited from a copied plugin ledger. */
+  async _bindDeviceIdentity() {
+    const meta = this.ledger.data.meta;
+    let id = typeof meta.deviceId === 'string' && meta.deviceId ? meta.deviceId : randomUuid();
+    try {
+      const storage = typeof window !== 'undefined' && window.localStorage;
+      if (storage && typeof storage.getItem === 'function' && typeof storage.setItem === 'function') {
+        const ad = this.app.vault.adapter;
+        let path = null;
+        try { if (typeof ad.getBasePath === 'function') path = ad.getBasePath(); } catch (_) { /* try the adapter property */ }
+        if (typeof path !== 'string' || !path.trim()) { try { path = ad.basePath; } catch (_) { /* use the vault name */ } }
+        const installation = typeof path === 'string' && path.trim() ? 'path:' + path.replace(/\\/g, '/').replace(/\/+$/, '') : 'name:' + this.app.vault.getName();
+        const key = 'tdrive-sync:device-id:' + encodeURIComponent(installation);
+        const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+        let stored = storage.getItem(key);
+        if (typeof stored !== 'string' || !uuid.test(stored)) {
+          storage.setItem(key, randomUuid());
+          stored = storage.getItem(key);
+          if (typeof stored !== 'string' || !uuid.test(stored)) throw new Error('Installation identity was not persisted');
+        }
+        id = stored;
+      }
+    } catch (_) { /* unavailable local storage retains the existing per-ledger owner */ }
+    if (meta.deviceId !== id) {
+      meta.deviceId = id;
+      // Do not enable sync under an identity that could not be durably recorded.
+      await this.ledger.save();
+    }
   }
 
   onunload() {
+    this._unloaded = true;
     if (this._timer) window.clearInterval(this._timer);
     if (this._changeTimer) window.clearTimeout(this._changeTimer);
-    if (this.engine) this.engine.pause();
+    if (this._startupTimer) window.clearTimeout(this._startupTimer);
+    this._timer = this._changeTimer = this._startupTimer = null;
+    this._pendingChange = false;
+    const releasing = this._cancelOperation();
+    this._crypto = null; this._cryptoTag = '';
+    return releasing;
   }
 
   /** (Re)computes the translation function from the language setting. */
@@ -683,23 +949,69 @@ class TdriveSyncPlugin extends Plugin {
     return a < b ? (h >= a && h < b) : (h >= a || h < b);   // wraps midnight when end < start
   }
 
-  /** Debounced auto-sync on local edits (opt-in). Sync's own writes are ignored via the running flag and a
-   *  short quiet window after each run, so a sync never re-triggers itself in a loop. "Instant" mode uses a 1s
-   *  debounce and also syncs when the app regains focus. */
+  _busy() { return !!this._operation || !!(this.engine && this.engine.running); }
+
+  /** The plugin guard spans all awaits, including the gap between metadata lookup and a mutation. */
+  async _withOperation(fn) {
+    if (this._unloaded || this.settings.paused) throw new Error(this.t('notice.pausedDone'));
+    if (!this.settings.apiKey) throw new Error(this.t('notice.noApiKey'));
+    if (this._busy()) throw new Error(this.t('notice.busy'));
+    const operation = {};
+    this._operation = operation;
+    try { this.notify(); return await fn(); }
+    finally {
+      try { if (operation.engine) await operation.engine.releaseOperationLease(); }
+      finally {
+        if (operation.engine) operation.engine.running = false;
+        if (this._operation === operation) this._operation = null;
+        this._scheduleChangeSync();
+        this.notify();
+      }
+    }
+  }
+
+  _cancelOperation() {
+    const engine = this._operation && this._operation.engine;
+    if (!engine) return Promise.resolve();
+    engine.pause();
+    return engine.releaseOperationLease().catch(() => { /* engine clears local lease state even if the server is unavailable */ });
+  }
+
+  _checkOperation(engine) {
+    if (this._unloaded || this.settings.paused || engine.stopRequested) throw new Error(this.t('notice.pausedDone'));
+    if (!this._operation || this._operation.engine !== engine || this.engine !== engine) throw new Error('Sync operation owner changed; retry the operation.');
+    const before = engine.getSettings();
+    if (Object.keys(before).some((k) => k in this.settings && JSON.stringify(before[k]) !== JSON.stringify(k === 'remoteFolder' ? folderPathFor(this.settings.remoteFolder || this.defaultRemoteFolder(), '') : this.settings[k]))) throw new Error('Sync settings changed; retry the operation with the current destination.');
+  }
+
+  _scheduleChangeSync() {
+    if (this._changeTimer) { window.clearTimeout(this._changeTimer); this._changeTimer = null; }
+    if (this._unloaded || !(this.settings.syncOnChange || this.settings.instantSync)) { this._pendingChange = false; return; }
+    if (!this._pendingChange || this.settings.paused || !this.settings.apiKey || this._busy()) return;
+    const secs = this.settings.instantSync ? 1 : Math.max(1, Number(this.settings.syncOnChangeDelaySeconds) || 2);
+    const delay = this.withinSchedule() ? Math.max(secs * 1000, this._quietUntil - Date.now()) : 60000;
+    this._changeTimer = window.setTimeout(() => {
+      this._changeTimer = null;
+      if (this._unloaded || !(this.settings.syncOnChange || this.settings.instantSync)) { this._pendingChange = false; return; }
+      if (this.settings.paused || !this.settings.apiKey || this._busy() || Date.now() < this._quietUntil || !this.withinSchedule()) { this._scheduleChangeSync(); return; }
+      this._pendingChange = false;
+      this.runSync({ silent: true, reason: 'change' });
+    }, delay);
+  }
+
+  /** Ignore only verified sync-owned content events; external edits remain pending while busy or quiet. */
   registerChangeSync() {
     const vault = this.app && this.app.vault;
     if (!vault || typeof vault.on !== 'function') return;   // adapter without events (tests/older builds)
     const schedule = (file) => {
-      if (!(this.settings.syncOnChange || this.settings.instantSync) || this.settings.paused) return;
-      if (!this.settings.apiKey) return;
-      if (this.engine && this.engine.running) return;
-      if (Date.now() < this._quietUntil) return;
-      if (!this.withinSchedule()) return;
+      if (this._unloaded) return;
       const p = file && file.path ? String(file.path) : '';
-      if (p.startsWith('.')) return;                        // .obsidian, hidden files, sync-state
-      if (this._changeTimer) window.clearTimeout(this._changeTimer);
-      const secs = this.settings.instantSync ? 1 : Math.max(2, Number(this.settings.syncOnChangeDelaySeconds) || 5);
-      this._changeTimer = window.setTimeout(() => { this._changeTimer = null; this.runSync({ silent: true, reason: 'change' }); }, secs * 1000);
+      if (this.local) this.local.captureChange(p);
+      if (!(this.settings.syncOnChange || this.settings.instantSync)) return;
+      if (p.split('/').some((part) => part.startsWith('.'))) return;
+      const changed = () => { if (!this._unloaded) { this._pendingChange = true; this._scheduleChangeSync(); } };
+      if (this.local && this.local._ownChanges.has(p)) return this.local.isOwnChange(p).then((own) => { if (!own) changed(); }).catch(changed);
+      else changed();
     };
     this.registerEvent(this.app.vault.on('modify', schedule));
     this.registerEvent(this.app.vault.on('create', schedule));
@@ -710,15 +1022,29 @@ class TdriveSyncPlugin extends Plugin {
     this.registerEvent(this.app.vault.on('rename', (f, oldPath) => { this.rememberMove(oldPath, f && f.path); schedule(f); }));
     // Near-instant: catch up as soon as the app is focused again (covers edits made while backgrounded).
     if (typeof window !== 'undefined' && window.addEventListener) {
-      const onFocus = () => { if (this.settings.instantSync && !this.settings.paused && this.settings.apiKey && !(this.engine && this.engine.running) && this.withinSchedule()) this.runSync({ silent: true, reason: 'focus' }); };
+      const onFocus = () => { if (!this._unloaded && this.settings.instantSync) { this._pendingChange = true; this._scheduleChangeSync(); } };
       window.addEventListener('focus', onFocus);
       if (this.register) this.register(() => window.removeEventListener('focus', onFocus));
     }
   }
 
   defaultRemoteFolder() { return '/Obsidian/' + this.app.vault.getName() + '/'; }
-  redact(str) { return this.engine ? this.engine.client.redact(str) : String(str).replace(/tdk_[A-Za-z0-9_\-]+/g, 'tdk_***'); }
-  async saveSettings() { await this.saveData(this.settings); }
+  redact(str) {
+    const client = this.engine && this.engine.client;
+    if (client && typeof client.redact === 'function') return client.redact(str);
+    const key = this.settings && this.settings.apiKey;
+    const text = key ? String(str).split(key).join('***') : String(str);
+    return text.replace(/tdk_[A-Za-z0-9_\-]+/g, 'tdk_***');
+  }
+  async saveSettings() {
+    const engine = this._operation && this._operation.engine;
+    if (engine) {
+      const before = engine.getSettings();
+      if (Object.keys(before).some((k) => k in this.settings && JSON.stringify(before[k]) !== JSON.stringify(k === 'remoteFolder' ? folderPathFor(this.settings.remoteFolder || this.defaultRemoteFolder(), '') : this.settings[k]))) this._cancelOperation();
+    }
+    await this.saveData(this.settings);
+    this._scheduleChangeSync();
+  }
 
   /** Shows a styled notification. Non-technical styles render real Lucide icons (Obsidian's icon set) next to
    *  each value; when the DOM/icons are unavailable (or for the technical style) the plain text is shown. */
@@ -761,8 +1087,8 @@ class TdriveSyncPlugin extends Plugin {
     } else el.setText(txt);
   }
 
-  makeClient() {
-    const client = new TdriveClient({ baseUrl: this.settings.baseUrl, apiKey: this.settings.apiKey, transport: makeThrottledTransport(() => this.settings) });
+  makeClient(settings = this.settings) {
+    const client = new TdriveClient({ baseUrl: settings.baseUrl, apiKey: settings.apiKey, transport: makeThrottledTransport(() => settings) });
     const known = this.ledger && this.ledger.data && this.ledger.data.meta && this.ledger.data.meta.uploadChunkSize;
     if (known) client._uploadChunk = known;   // reuse the server's enforced part size (avoids a re-opened session)
     // Retry notice (once per run, so notifications stay concise). Pure formatting; no engine change.
@@ -770,51 +1096,65 @@ class TdriveSyncPlugin extends Plugin {
     return client;
   }
 
-  /** Returns a cached CryptoManager when E2EE is on and a passphrase is set, else null (plaintext).
+  /** Returns a cached CryptoManager when E2EE is on; missing passphrases block the operation.
    *  The salt is a constant (or a user-set value) so all devices with the same passphrase agree on the key. */
-  makeCrypto() {
-    const s = this.settings;
-    if (!s.e2eeEnabled || !s.e2eePassphrase) { this._crypto = null; this._cryptoTag = ''; return null; }
+  makeCrypto(s = this.settings) {
+    if (!s.e2eeEnabled) { this._crypto = null; this._cryptoTag = ''; return null; }
+    if (typeof s.e2eePassphrase !== 'string' || !s.e2eePassphrase.length) {
+      this._crypto = null; this._cryptoTag = '';
+      throw new Error('Encryption is enabled but the passphrase is empty');
+    }
     const salt = s.e2eeSalt || CryptoManager.DEFAULT_SALT || 'tdrive-sync-e2ee-v1';
-    const tag = s.e2eePassphrase + '|' + salt;
+    const tag = JSON.stringify([s.e2eePassphrase, salt]);
     if (!this._crypto || this._cryptoTag !== tag) { this._crypto = new CryptoManager(s.e2eePassphrase, salt); this._cryptoTag = tag; }
     return this._crypto;
   }
 
   /** Returns a cached Compressor when compression is enabled, else null (store bytes as-is). */
-  makeCompressor() {
-    const s = this.settings;
+  makeCompressor(s = this.settings) {
     if (!s.compressTextFiles) return null;
     return new Compressor({ minBytes: Math.max(4, Number(s.compressMinKB) || 64) * 1024 });
   }
 
   makeEngine() {
-    const client = this.makeClient();
-    const getSettings = () => ({
+    const s = Object.freeze({
       ...this.settings,
-      remoteFolder: this.settings.remoteFolder || this.defaultRemoteFolder(),
+      excludePatterns: Object.freeze([...(this.settings.excludePatterns || [])]),
+      syncFolders: Object.freeze([...(this.settings.syncFolders || [])]),
+      remoteFolder: folderPathFor(this.settings.remoteFolder || this.defaultRemoteFolder(), ''),
       maxFileBytes: this.settings.maxFileSizeMB > 0 ? this.settings.maxFileSizeMB * 1024 * 1024 : 0,
       cellularMaxFileBytes: this.settings.cellularMaxFileMB > 0 ? this.settings.cellularMaxFileMB * 1024 * 1024 : 0,
       streamThresholdBytes: this.settings.streamThresholdMB > 0 ? this.settings.streamThresholdMB * 1024 * 1024 : 8 * 1024 * 1024,
       dedupeUploads: this.settings.dedupeUploads,
       networkIsCellular: networkLooksCellular,
     });
+    const crypto = this.makeCrypto(s);
+    const client = this.makeClient(s);
+    const getSettings = () => s;
     let lastTick = 0;
-    this.engine = new SyncEngine({
-      client, local: this.local, manifest: this.ledger, getSettings, crypto: this.makeCrypto(), compressor: this.makeCompressor(),
+    const engine = new SyncEngine({
+      client, local: this.local, manifest: this.ledger, getSettings, crypto, compressor: this.makeCompressor(s),
+      operationValidity: () => { this._checkOperation(engine); return true; },
       onProgress: (p) => { this.progress = p; const now = Date.now(); if (now - lastTick > 400) { lastTick = now; this.notify(); } },
     });
-    return this.engine;
+    this.engine = engine;
+    this._engineSettings = s;
+    if (this._operation) this._operation.engine = engine;
+    return engine;
   }
 
   async testConnection() {
     try {
-      const client = this.makeClient();
-      await client.me(); const lim = await client.limits();
-      let part = null;
-      try { part = await client.uploadChunkSize(); } catch (e) { /* optional */ }
-      this.connection = `✓ ${new Date().toLocaleTimeString()} — ${Math.round((part || lim.chunkBytes) / 1024)} KB`;
-      new Notice(this.t('notice.connectionOk'));
+      await this._withOperation(async () => {
+        const engine = this.makeEngine(); const client = engine.client;
+        await client.me(); this._checkOperation(engine);
+        const lim = await client.limits(); this._checkOperation(engine);
+        let part = null;
+        try { part = await client.uploadChunkSize(); } catch (e) { /* optional */ }
+        this._checkOperation(engine);
+        this.connection = `✓ ${new Date().toLocaleTimeString()} — ${Math.round((part || lim.chunkBytes) / 1024)} KB`;
+        new Notice(this.t('notice.connectionOk'));
+      });
     } catch (e) {
       this.connection = '✗ ' + this.redact(e.message);
       new Notice(this.t('notice.connectionFail', { msg: this.redact(e.message) }), 8000);
@@ -823,33 +1163,42 @@ class TdriveSyncPlugin extends Plugin {
   }
 
   async runSync(opts = {}) {
+    if (this._unloaded) return null;
     const style = this.settings.notifyStyle;
     if (this.settings.paused) { if (!opts.silent) this.showNotice(NOTIFY.formatState(style, this.t, 'paused')); return null; }
     if (!this.settings.apiKey) { if (!opts.silent) this.showNotice(NOTIFY.formatState(style, this.t, 'noApiKey')); return null; }
-    if (this.engine && this.engine.running) { if (!opts.silent) this.showNotice(NOTIFY.formatState(style, this.t, 'busy')); return null; }
-    this._retryNotified = false;
-    const started = Date.now();
-    let rep;
-    try { rep = await this.makeEngine().syncNow(opts); }
-    catch (e) { new Notice('Tdrive: ' + this.redact(e.message), 8000); this.notify(); return null; }
-    rep.durationMs = Date.now() - started;   // for the detailed style; the engine is untouched
-    if (rep.status === 'locked') {
-      if (!opts.silent) this.showNotice(NOTIFY.formatState(style, this.t, 'locked'));
+    if (this._busy()) { if (!opts.silent) this.showNotice(NOTIFY.formatState(style, this.t, 'busy')); return null; }
+    if (opts.reason && (!this.withinSchedule() || (opts.reason === 'change' && !(this.settings.syncOnChange || this.settings.instantSync)) || (opts.reason === 'startup' && !this.settings.syncOnStartup) || (opts.reason === 'interval' && !(this.settings.autoSyncMinutes > 0)))) return null;
+    return this._withOperation(async () => {
+      this._retryNotified = false;
+      const started = Date.now();
+      let engine;
+      let rep;
+      try { engine = this.makeEngine(); this._operation.engine = engine; rep = await engine.syncNow(opts); }
+      catch (e) { new Notice('Tdrive: ' + this.redact(e.message), 8000); this.notify(); return null; }
+      rep.durationMs = Date.now() - started;
+      if (rep.status === 'locked') {
+        if (!opts.silent) this.showNotice(NOTIFY.formatState(style, this.t, 'locked'));
+        this.notify();
+        return rep;
+      }
+      const blockedNotice = NOTIFY.formatWarning(style, this.t, rep);
+      if (blockedNotice && !opts.silent) this.showNotice(blockedNotice);
+      if (rep.status === 'blocked' && !opts.silent) {
+        const n = (rep.blockedFolders || []).length;
+        const codes = [...new Set((rep.blockedFolders || []).map((b) => b.code || 'UPLOAD_IN_PROGRESS'))].join(', ');
+        const arrivals = (rep.blockedFolders || []).some((b) => b.code === 'FOLDER_NOT_EMPTY');
+        this.showNotice({ text: this.lang === 'ar' ? `Tdrive: حذف ${n} مجلد مؤجل من الخادم (${codes}). ${arrivals ? 'احتفظ بالمحتويات الجديدة؛ راجع الحالة.' : 'تستمر مزامنة الملفات الأخرى؛ راجع الحالة.'}` : `Tdrive: ${n} folder deletion(s) deferred (${codes}). ${arrivals ? 'New arrivals are preserved' : 'Other files can still sync'}; see sync status.`, timeout: 9000 });
+      } else if (rep.status === 'deferred') {
+        // The server is briefly busy (retried, still deferred). Treat it as "try again soon", not a failure.
+        if (!opts.silent) this.showNotice({ style, text: (style === 'technical' ? `Tdrive: ${this.t('notify.state.deferred')}` : this.t('notify.state.deferred')), rows: style === 'technical' ? null : [[{ icon: 'retry', text: this.t('notify.state.deferred') }]], timeout: 9000 });
+      } else if (!opts.silent) this.showNotice(NOTIFY.formatResult(style, this.t, rep));
+      this._quietUntil = Date.now() + 3000;
+      const ch = engine.client._uploadChunk;
+      if (ch && ch !== this.ledger.data.meta.uploadChunkSize) { this.ledger.data.meta.uploadChunkSize = ch; try { await this.ledger.save(); } catch (e) { /* non-fatal */ } }
       this.notify();
       return rep;
-    }
-    const blockedNotice = NOTIFY.formatWarning(style, this.t, rep);
-    if (blockedNotice && !opts.silent) this.showNotice(blockedNotice);
-    if (rep.status === 'deferred') {
-      // The server is briefly busy (retried, still deferred). Treat it as "try again soon", not a failure.
-      if (!opts.silent) this.showNotice({ style, text: (style === 'technical' ? `Tdrive: ${this.t('notify.state.deferred')}` : this.t('notify.state.deferred')), rows: style === 'technical' ? null : [[{ icon: 'retry', text: this.t('notify.state.deferred') }]], timeout: 9000 });
-    } else if (!opts.silent) this.showNotice(NOTIFY.formatResult(style, this.t, rep));
-    this._quietUntil = Date.now() + 3000;   // ignore our own writes firing vault events right after
-    // Remember the server's real part size so the next run does not re-open a probe session.
-    const ch = this.engine && this.engine.client && this.engine.client._uploadChunk;
-    if (ch && ch !== this.ledger.data.meta.uploadChunkSize) { this.ledger.data.meta.uploadChunkSize = ch; try { await this.ledger.save(); } catch (e) { /* non-fatal */ } }
-    this.notify();
-    return rep;
+    });
   }
 
   /** Writes the sync log + a small diagnostic header to a text file inside the plugin folder (never synced:
@@ -877,29 +1226,35 @@ class TdriveSyncPlugin extends Plugin {
 
   /** Computes what a sync would do and shows it without changing anything. */
   async previewSync() {
+    if (this._unloaded) return;
     const style = this.settings.notifyStyle;
     if (this.settings.paused) { this.showNotice(NOTIFY.formatState(style, this.t, 'paused')); return; }
     if (!this.settings.apiKey) { this.showNotice(NOTIFY.formatState(style, this.t, 'noApiKey')); return; }
-    if (this.engine && this.engine.running) { this.showNotice(NOTIFY.formatState(style, this.t, 'busy')); return; }
+    if (this._busy()) { this.showNotice(NOTIFY.formatState(style, this.t, 'busy')); return; }
     this._retryNotified = false;
     try {
-      const rep = await this.makeEngine().syncNow({ dryRun: true });
-      new PreviewModal(this.app, this, rep).open();
+      await this._withOperation(async () => {
+        const rep = await this.makeEngine().syncNow({ dryRun: true });
+        new PreviewModal(this.app, this, rep).open();
+      });
     } catch (e) { new Notice('Tdrive: ' + this.redact(e.message), 8000); }
   }
 
   /** Restores the remote files deleted by the most recent sync from the Tdrive trash. */
   async restoreDeletes() {
+    if (this._unloaded) return;
     if (!this.settings.apiKey) { new Notice(this.t('notice.noApiKey')); return; }
-    if (this.engine && this.engine.running) { new Notice(this.t('notice.busy')); return; }
+    if (this._busy()) { new Notice(this.t('notice.busy')); return; }
     const audit = (this.ledger.data.meta.deletions || []);
     if (!audit.length) { new Notice(this.t('notice.noDeletes')); return; }
     try {
-      const rep = await (this.engine || this.makeEngine()).restoreLastDeletions();
-      let m = this.t('notice.restored', { restored: rep.restored });
-      if (rep.failed) m += this.t('notice.restoredFailed', { failed: rep.failed });
-      if (rep.skipped) m += this.t('notice.restoredSkipped', { skipped: rep.skipped });
-      new Notice(m, 10000);
+      await this._withOperation(async () => {
+        const rep = await this.makeEngine().restoreLastDeletions();
+        let m = this.t('notice.restored', { restored: rep.restored });
+        if (rep.failed) m += this.t('notice.restoredFailed', { failed: rep.failed });
+        if (rep.skipped) m += this.t('notice.restoredSkipped', { skipped: rep.skipped });
+        new Notice(m, 10000);
+      });
     } catch (e) { new Notice('Tdrive: ' + this.redact(e.message), 8000); }
     this.notify();
   }
@@ -907,18 +1262,22 @@ class TdriveSyncPlugin extends Plugin {
   approveDeletes() {
     const pend = this.ledger.data.meta.blockedDeletes;
     if (!pend || !pend.items || !pend.items.length) { new Notice(this.t('notice.noPendingDeletes')); return; }
-    if (pend.reason !== 'limit') { new Notice(this.t('notice.deleteBlockedReason', { reason: pend.reason }), 8000); return; }
+    if (pend.reason !== 'limit' && pend.reason !== 'changed') { new Notice(this.t('notice.deleteBlockedReason', { reason: pend.reason }), 8000); return; }
     new ApproveDeletesModal(this.app, this, pend).open();
   }
 
   /** One-off cleanup of empty folders that older versions left on Tdrive (they never deleted folders). */
   async cleanEmptyRemoteFolders() {
+    if (this._unloaded) return;
     if (!this.settings.apiKey) { new Notice(this.t('notice.noApiKey')); return; }
-    if (this.engine && this.engine.running) { new Notice(this.t('notice.busy')); return; }
+    if (this._busy()) { new Notice(this.t('notice.busy')); return; }
     try {
-      const rep = await this.makeEngine().cleanEmptyRemoteFolders();
-      await this.ledger.save();
-      new Notice(rep.failures.length ? this.t('notice.cleanFailed', { deleted: rep.deleted, failed: rep.failures.length, msg: this.redact(rep.failures[0].error) }) : this.t('notice.cleaned', { deleted: rep.deleted }), 8000);
+      await this._withOperation(async () => {
+        const rep = await this.makeEngine().cleanEmptyRemoteFolders();
+        await this.ledger.save();
+        if ((rep.blockedFolders || []).length) new Notice(this.lang === 'ar' ? 'حذف بعض المجلدات مؤجل من خادم Tdrive؛ راجع حالة المزامنة.' : 'Some folder deletions are blocked by Tdrive; see sync status.', 8000);
+        else new Notice(rep.failures.length ? this.t('notice.cleanFailed', { deleted: rep.deleted, failed: rep.failures.length, msg: this.redact(rep.failures[0].error) }) : this.t('notice.cleaned', { deleted: rep.deleted }), 8000);
+      });
     } catch (e) { new Notice('Tdrive: ' + this.redact(e.message), 8000); }
     this.notify();
   }
@@ -929,35 +1288,85 @@ class TdriveSyncPlugin extends Plugin {
     await this.runSync({ only: [f.path.normalize('NFC')] });
   }
 
-  async resolveConflict(path, choice) {
-    const eng = this.engine || this.makeEngine();
-    await eng.conflicts.resolve(path, choice, eng);
-    this.notify();
+  async viewConflicts() {
+    const paths = this.ledger.conflictKeys();
+    const active = this.app.workspace.getActiveFile();
+    const path = active && paths.includes(active.path.normalize('NFC')) ? active.path.normalize('NFC') : paths.length === 1 ? paths[0] : null;
+    if (path) return new ConflictModal(this.app, this, path).open();
+    return this.activateView();
+  }
+
+  async resolveConflict(path, choice, reviewed) {
+    if (choice === 'cancel') return { resolved: false };
+    if (this._unloaded || this.settings.paused) throw new Error(this.t('notice.pausedDone'));
+    if (!this.settings.apiKey) throw new Error(this.t('notice.noApiKey'));
+    const reviewState = (conflict) => { if (!conflict) return null; const { resolution, ...versions } = conflict; return JSON.stringify(versions); };
+    try { return await this._withOperation(async () => {
+      const eng = this.makeEngine();
+      this._checkOperation(eng);
+      if (reviewed && (reviewed.scope !== this.ledger.data.meta.syncScope || reviewState(reviewed.conflict) !== reviewState(this.ledger.getConflict(path)))) throw new Error('Conflict changed; reopen it before resolving.');
+      try {
+        const result = await eng.conflicts.resolve(path, choice, eng, { reviewed: reviewed && reviewed.conflict, checkActive: () => this._checkOperation(eng) });
+        if (!result || !result.resolved) this.ledger.addLog('warn', this.redact(`Conflict remains open: ${path}${result && result.draft ? '; merge draft: ' + result.draft : ''}`));
+        return result;
+      }
+      finally { this._quietUntil = Date.now() + 3000; this.notify(); }
+    }); } catch (e) {
+      this.ledger.addLog('error', this.redact(`Conflict resolution failed: ${path}: ${e.message}`));
+      this.notify(); throw e;
+    }
   }
 
   /** The remote id we recorded for a local path (needed for versions / share links). */
-  remoteIdFor(path) {
+  async remoteIdFor(path) {
+    if (this._unloaded) return null;
+    return this._withOperation(async () => (await this._remoteFileContext(path)).id);
+  }
+
+  async _remoteFileContext(path) {
+    const engine = this.makeEngine(); engine.running = true;
+    this._operation.engine = engine;
+    await engine.prepare({ acquireLease: false });
+    this._checkOperation(engine);
     const e = this.ledger.getFile(path);
-    return e && e.remoteId ? e.remoteId : null;
+    return { engine, id: e && e.remoteId ? e.remoteId : null, scope: this.ledger.data.meta.syncScope };
   }
 
   /** Lists archived versions of the current file and lets the user roll back to one. */
   async viewVersions() {
     const f = this.app.workspace.getActiveFile();
     if (!f) { new Notice(this.t('notice.noOpenFile')); return; }
-    const id = this.remoteIdFor(f.path.normalize('NFC'));
-    if (!id) { new Notice(this.t('versions.notSynced')); return; }
-    new VersionsModal(this.app, this, f.path, id).open();
+    try {
+      await this._withOperation(async () => {
+        const { engine, id, scope } = await this._remoteFileContext(f.path.normalize('NFC'));
+        if (!id) { new Notice(this.t('versions.notSynced')); return; }
+        const r = await engine.client.request({ path: `/files/${encodeURIComponent(id)}/versions` });
+        this._checkOperation(engine);
+        const versions = (r && (r.versions || r.items)) || (Array.isArray(r) ? r : []);
+        new VersionsModal(this.app, this, f.path, id, versions, scope).open();
+      });
+    } catch (e) { new Notice(this.t('versions.failed', { msg: this.redact(e.message) }), 8000); }
   }
 
   /** Creates a share link for the current file and copies it to the clipboard. */
   async shareCurrent() {
     const f = this.app.workspace.getActiveFile();
     if (!f) { new Notice(this.t('notice.noOpenFile')); return; }
-    const id = this.remoteIdFor(f.path.normalize('NFC'));
-    if (!id) { new Notice(this.t('versions.notSynced')); return; }
     try {
-      const r = await this.makeClient().request({ method: 'POST', path: `/files/${encodeURIComponent(id)}/shares`, headers: { 'Content-Type': 'application/json' }, body: new TextEncoder().encode(JSON.stringify({ permission: 'download' })).buffer });
+      const r = await this._withOperation(async () => {
+        const { engine, id } = await this._remoteFileContext(f.path.normalize('NFC'));
+        if (!id) { new Notice(this.t('versions.notSynced')); return null; }
+        const lock = await engine.acquireOperationLease();
+        if (lock && lock.blocked) throw new Error(this.t('notice.busy'));
+        this._checkOperation(engine);
+        const current = await engine.client.getFile(id);
+        this._checkOperation(engine);
+        const r = await engine.client.request({ method: 'POST', path: `/files/${encodeURIComponent(id)}/shares`, headers: { 'Content-Type': 'application/json' }, body: new TextEncoder().encode(JSON.stringify({ permission: 'download', ...(current.contentVersion == null ? {} : { expectedVersion: current.contentVersion }) })).buffer });
+        engine._markRemoteMutated();
+        this._checkOperation(engine);
+        return r;
+      });
+      if (!r) return;
       const url = (r && (r.url || (r.share && r.share.url))) || '';
       if (!url) throw new Error('no url');
       try { await navigator.clipboard.writeText(url); new Notice(this.t('share.copied')); }
@@ -971,13 +1380,14 @@ class TdriveSyncPlugin extends Plugin {
   /** Selective-sync folder picker. */
   chooseSyncFolders() { new FolderPickerModal(this.app, this).open(); }
 
-  async pause() { this.settings.paused = true; await this.saveSettings(); if (this.engine) this.engine.pause(); new Notice(this.t('notice.pausedDone')); this.notify(); }
+  async pause() { this.settings.paused = true; const releasing = this._cancelOperation(); this.notify(); await releasing; await this.saveSettings(); new Notice(this.t('notice.pausedDone')); }
   async resume() { this.settings.paused = false; await this.saveSettings(); new Notice(this.t('notice.resumedDone')); this.notify(); }
 
   /** Records a rename/move seen by the editor: old path -> new path. Bounded and persisted (best effort).
    *  The engine consumes these hints to perform an in-place move (same server file id) instead of a
    *  create-new + delete-old, which is what previously left stale duplicates after "move then edit". */
   rememberMove(oldPath, newPath) {
+    if (this._unloaded) return;
     const from = String(oldPath || '').normalize('NFC');
     const to = String(newPath || '').normalize('NFC');
     if (!from || !to || from === to) return;
@@ -997,9 +1407,10 @@ class TdriveSyncPlugin extends Plugin {
 
   setupAutoSync() {
     if (this._timer) { window.clearInterval(this._timer); this._timer = null; }
+    if (this._unloaded) return;
     const m = this.settings.autoSyncMinutes;
     if (m > 0) {
-      this._timer = window.setInterval(() => { if (this.withinSchedule()) this.runSync({ silent: true }); }, m * 60000);
+      this._timer = window.setInterval(() => { if (this.settings.autoSyncMinutes > 0 && this.withinSchedule()) this.runSync({ silent: true, reason: 'interval' }); }, m * 60000);
       if (this.registerInterval) this.registerInterval(this._timer);
     }
   }
@@ -1017,13 +1428,16 @@ class TdriveSyncPlugin extends Plugin {
   /** Logs field NAMES only (never values/contents) of the API's real responses, to verify assumptions. */
   async probeApi() {
     try {
-      const c = this.makeClient(); const shape = (o) => (o && typeof o === 'object' ? Object.keys(o).join(', ') : typeof o);
-      const info = await c.info(); this.ledger.addLog('info', 'GET /api/v1 keys: ' + shape(info) + ' | upload keys: ' + shape(info && info.upload));
-      const root = this.settings.remoteFolder || this.defaultRemoteFolder();
-      const raw = await c.request({ path: '/files', query: { path: root, limit: 100 } });
-      this.ledger.addLog('info', 'GET /files keys: ' + shape(raw));
-      for (const k of Object.keys(raw || {})) if (Array.isArray(raw[k]) && raw[k][0] != null) this.ledger.addLog('info', `  ${k}: ${raw[k].length} item(s); [0] keys: ` + shape(raw[k][0]));
-      await this.ledger.save(); new Notice(this.t('notice.probed'));
+      await this._withOperation(async () => {
+        const engine = this.makeEngine(); const c = engine.client; const shape = (o) => (o && typeof o === 'object' ? Object.keys(o).join(', ') : typeof o);
+        const info = await c.info(); this._checkOperation(engine);
+        this.ledger.addLog('info', 'GET /api/v1 keys: ' + shape(info) + ' | upload keys: ' + shape(info && info.upload));
+        const raw = await c.request({ path: '/files', query: { path: engine.getSettings().remoteFolder, limit: 100 } });
+        this._checkOperation(engine);
+        this.ledger.addLog('info', 'GET /files keys: ' + shape(raw));
+        for (const k of Object.keys(raw || {})) if (Array.isArray(raw[k]) && raw[k][0] != null) this.ledger.addLog('info', `  ${k}: ${raw[k].length} item(s); [0] keys: ` + shape(raw[k][0]));
+        await this.ledger.save(); this._checkOperation(engine); new Notice(this.t('notice.probed'));
+      });
     } catch (e) { new Notice(this.t('notice.probeFailed', { msg: this.redact(e.message) }), 8000); }
     this.notify();
   }
